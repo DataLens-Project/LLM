@@ -6,9 +6,11 @@ from typing import Any
 from datetime import datetime
 
 import ollama
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from scipy import stats
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -66,6 +68,15 @@ class AnalysisReportModel(Base):
     summary_json = Column(Text, nullable=False)
     evidence_json = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ReportUpdateRequest(BaseModel):
+    file_name: str | None = None
+
+
+class AssistantAskRequest(BaseModel):
+    report_id: int
+    question: str
 
 
 Base.metadata.create_all(bind=ENGINE)
@@ -204,12 +215,48 @@ def _build_summary(df: pd.DataFrame) -> dict[str, Any]:
 
 
 def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
-    evidence: dict[str, Any] = {"t_test": None, "correlation": None}
+    evidence: dict[str, Any] = {
+        "t_test": None,
+        "correlation": None,
+        "anova": None,
+        "regression": None,
+        "chi_square": None,
+    }
 
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    categorical_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+    def is_id_like(col_name: str, series: pd.Series) -> bool:
+        name = col_name.lower()
+        if any(k in name for k in ["id", "idx", "code", "코드", "번호"]):
+            return True
+        non_null = series.dropna()
+        if len(non_null) == 0:
+            return False
+        unique_ratio = non_null.nunique() / len(non_null)
+        return unique_ratio > 0.98
 
-    # 1) 이진 집단 + 수치형 1개에 대한 t-test
+    # 숫자형 중 연속형 후보만 사용(고유값이 너무 적은 컬럼 제외)
+    numeric_cols = []
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        if is_id_like(str(c), df[c]):
+            continue
+        if df[c].dropna().nunique() <= 8:
+            continue
+        numeric_cols.append(c)
+
+    categorical_cols = []
+    for c in df.columns:
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            if s.dropna().nunique() <= 8 and not is_id_like(str(c), s):
+                categorical_cols.append(c)
+        else:
+            if s.dropna().nunique() >= 2:
+                categorical_cols.append(c)
+
+    # 1) T-검정: 이진 집단 + 수치형 (효과크기 d가 큰 조합)
+    best_t = None
+    best_d = -1.0
     for gcol in categorical_cols:
         non_null = df[gcol].dropna()
         if non_null.nunique() != 2:
@@ -217,29 +264,31 @@ def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
         levels = list(non_null.unique())
         for vcol in numeric_cols:
             subset = df[[gcol, vcol]].dropna()
-            if len(subset) < 10:
+            if len(subset) < 30:
                 continue
             g1 = subset[subset[gcol] == levels[0]][vcol]
             g2 = subset[subset[gcol] == levels[1]][vcol]
-            if len(g1) < 3 or len(g2) < 3:
+            if len(g1) < 10 or len(g2) < 10:
                 continue
-
             t_stat, p_val = stats.ttest_ind(g1, g2, equal_var=False)
-            evidence["t_test"] = {
-                "group_col": str(gcol),
-                "value_col": str(vcol),
-                "group_a": str(levels[0]),
-                "group_b": str(levels[1]),
-                "mean_a": round(float(g1.mean()), 3),
-                "mean_b": round(float(g2.mean()), 3),
-                "t_stat": round(float(t_stat), 3),
-                "p_value": round(float(p_val), 4),
-            }
-            break
-        if evidence["t_test"]:
-            break
+            pooled_std = np.sqrt((g1.var(ddof=1) + g2.var(ddof=1)) / 2)
+            d = abs(float((g1.mean() - g2.mean()) / pooled_std)) if pooled_std > 0 else 0.0
+            if d > best_d:
+                best_d = d
+                best_t = {
+                    "group_col": str(gcol),
+                    "value_col": str(vcol),
+                    "group_a": str(levels[0]),
+                    "group_b": str(levels[1]),
+                    "mean_a": round(float(g1.mean()), 3),
+                    "mean_b": round(float(g2.mean()), 3),
+                    "t_stat": round(float(t_stat), 3),
+                    "p_value": round(float(p_val), 4),
+                    "cohen_d": round(float(d), 3),
+                }
+    evidence["t_test"] = best_t
 
-    # 2) 수치형 간 상관분석에서 절대값 기준 가장 강한 쌍
+    # 2) 상관분석: 절대 상관계수 최대쌍
     if len(numeric_cols) >= 2:
         best_pair = None
         best_abs_r = -1.0
@@ -247,7 +296,7 @@ def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
             for j in range(i + 1, len(numeric_cols)):
                 c1, c2 = numeric_cols[i], numeric_cols[j]
                 subset = df[[c1, c2]].dropna()
-                if len(subset) < 5:
+                if len(subset) < 30:
                     continue
                 r, p_val = stats.pearsonr(subset[c1], subset[c2])
                 if abs(float(r)) > best_abs_r:
@@ -260,7 +309,173 @@ def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
                     }
         evidence["correlation"] = best_pair
 
+    # 3) ANOVA: 3개 이상 집단 + 수치형 (eta^2 최대 조합)
+    best_anova = None
+    best_eta = -1.0
+    for gcol in categorical_cols:
+        nun = df[gcol].dropna().nunique()
+        if nun < 3 or nun > 12:
+            continue
+        for vcol in numeric_cols:
+            sub = df[[gcol, vcol]].dropna()
+            if len(sub) < 50:
+                continue
+            groups = [grp[vcol].values for _, grp in sub.groupby(gcol)]
+            if len(groups) < 3 or any(len(g) < 10 for g in groups):
+                continue
+            f_stat, p_val = stats.f_oneway(*groups)
+            all_vals = np.concatenate(groups)
+            grand = all_vals.mean()
+            ss_between = sum(len(g) * (g.mean() - grand) ** 2 for g in groups)
+            ss_total = sum((all_vals - grand) ** 2)
+            eta_sq = float(ss_between / ss_total) if ss_total > 0 else 0.0
+            if eta_sq > best_eta:
+                best_eta = eta_sq
+                best_anova = {
+                    "group_col": str(gcol),
+                    "value_col": str(vcol),
+                    "f_stat": round(float(f_stat), 3),
+                    "p_value": round(float(p_val), 4),
+                    "eta_squared": round(float(eta_sq), 3),
+                    "n_groups": int(nun),
+                }
+    evidence["anova"] = best_anova
+
+    # 4) 회귀분석: 구매/매출 계열 컬럼 우선 타깃 선택
+    if len(numeric_cols) >= 3:
+        target = None
+        priority_keys = ["매출", "구매", "revenue", "sales", "amount", "금액", "총구매"]
+        for c in numeric_cols:
+            lowered = str(c).lower()
+            if any(k.lower() in lowered for k in priority_keys):
+                target = c
+                break
+        if target is None:
+            target = max(numeric_cols, key=lambda c: float(df[c].dropna().std()) if len(df[c].dropna()) else 0)
+
+        corr_scores = []
+        for c in numeric_cols:
+            if c == target:
+                continue
+            sub = df[[target, c]].dropna()
+            if len(sub) < 30:
+                continue
+            r, _ = stats.pearsonr(sub[target], sub[c])
+            corr_scores.append((abs(float(r)), c))
+        corr_scores.sort(reverse=True)
+        features = [c for _, c in corr_scores[:3]]
+        if len(features) >= 2:
+            evidence["regression"] = {
+                "target": str(target),
+                "features": [str(f) for f in features],
+                "note": "다중회귀 후보",
+            }
+
+    # 5) 카이제곱: 범주형-범주형 조합
+    best_chi = None
+    best_chi2 = -1.0
+    if len(categorical_cols) >= 2:
+        for i in range(len(categorical_cols)):
+            for j in range(i + 1, len(categorical_cols)):
+                c1, c2 = categorical_cols[i], categorical_cols[j]
+                sub = df[[c1, c2]].dropna()
+                if len(sub) < 50:
+                    continue
+                tbl = pd.crosstab(sub[c1], sub[c2])
+                if tbl.shape[0] < 2 or tbl.shape[1] < 2:
+                    continue
+                chi2, p_val, dof, _ = stats.chi2_contingency(tbl)
+                if chi2 > best_chi2:
+                    best_chi2 = float(chi2)
+                    best_chi = {
+                        "col1": str(c1),
+                        "col2": str(c2),
+                        "chi2": round(float(chi2), 3),
+                        "p_value": round(float(p_val), 4),
+                        "dof": int(dof),
+                    }
+        evidence["chi_square"] = best_chi
+
     return evidence
+
+
+def _build_method_options(evidence: dict[str, Any]) -> list[dict[str, str]]:
+    options = []
+
+    corr = evidence.get("correlation")
+    reg = evidence.get("regression")
+    anova = evidence.get("anova")
+    chi = evidence.get("chi_square")
+
+    options.append(
+        {
+            "method": "상관분석 (Correlation)",
+            "when_to_use": "두 수치형 변수 간 관계를 확인할 때",
+            "current_fit": (
+                f"적합도 높음: {corr['col_x']}–{corr['col_y']} (r={corr['r']}, p={corr['p_value']})"
+                if corr else "적합도 중간: 수치형 변수가 충분하면 적용 가능"
+            ),
+        }
+    )
+    options.append(
+        {
+            "method": "회귀분석 (Regression)",
+            "when_to_use": "여러 요인이 목표 변수에 미치는 영향을 보고 예측할 때",
+            "current_fit": (
+                f"적합도 높음: target={reg['target']}, features={', '.join(reg['features'])}"
+                if reg else "적합도 중간: 수치형 변수 3개 이상이면 권장"
+            ),
+        }
+    )
+    options.append(
+        {
+            "method": "분산분석 (ANOVA)",
+            "when_to_use": "3개 이상 집단의 평균 차이를 비교할 때",
+            "current_fit": (
+                f"적합도 높음: {anova['group_col']} vs {anova['value_col']} (p={anova['p_value']})"
+                if anova else "적합도 중간: 3개 이상 집단 범주형 변수가 있으면 적용 가능"
+            ),
+        }
+    )
+    options.append(
+        {
+            "method": "교차분석 (Chi-square)",
+            "when_to_use": "범주형 변수 간 관련성을 볼 때",
+            "current_fit": (
+                f"적합도 높음: {chi['col1']} vs {chi['col2']} (p={chi['p_value']})"
+                if chi else "적합도 중간: 범주형 변수 2개 이상이면 적용 가능"
+            ),
+        }
+    )
+
+    return options
+
+
+def _choose_primary_method(question: str, evidence: dict[str, Any]) -> str:
+    q = (question or "").lower()
+
+    if any(k in q for k in ["예측", "영향", "회귀", "predict"]):
+        return "회귀분석" if evidence.get("regression") else "상관분석"
+    if any(k in q for k in ["관계", "상관", "correlation"]):
+        return "상관분석" if evidence.get("correlation") else "회귀분석"
+    if any(k in q for k in ["집단", "차이", "비교", "t-검정", "anova"]):
+        if evidence.get("anova") and evidence["anova"]["p_value"] < 0.05:
+            return "ANOVA"
+        if evidence.get("t_test"):
+            return "T-검정"
+
+    # 기본: 설명력이 큰 순서
+    if evidence.get("regression"):
+        return "회귀분석"
+    if evidence.get("correlation"):
+        return "상관분석"
+    if evidence.get("anova"):
+        return "ANOVA"
+    if evidence.get("t_test"):
+        return "T-검정"
+    if evidence.get("chi_square"):
+        return "교차분석"
+    return "기술통계"
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -299,39 +514,73 @@ def _serialize_report(model: AnalysisReportModel) -> dict[str, Any]:
     }
 
 
+def _assistant_fallback_answer(report: dict[str, Any], question: str) -> str:
+    rec = report.get("recommended_method", "기술통계")
+    exp = report.get("explanation", "")
+    insights = report.get("insights", [])
+    summary = report.get("summary", {})
+    evidence = report.get("evidence", {})
+
+    lines = [
+        f"이번 분석의 핵심 기법은 {rec}입니다.",
+        f"데이터 규모는 {summary.get('row_count', 0)}행, {summary.get('column_count', 0)}열이며 결측치는 {summary.get('missing_total', 0)}개입니다.",
+    ]
+    if exp:
+        lines.append(f"주요 해석은 다음과 같습니다: {exp}")
+    if isinstance(insights, list) and insights:
+        lines.append(f"핵심 시사점은 {insights[0]}")
+    if isinstance(evidence, dict) and evidence.get("correlation"):
+        corr = evidence.get("correlation")
+        lines.append(
+            f"참고로 상관 근거는 {corr.get('col_x')}–{corr.get('col_y')}에서 r={corr.get('r')}, p={corr.get('p_value')}입니다."
+        )
+    lines.append(f"질문 '{question}'에 대해 더 구체적으로 원하면 어떤 지표를 기준으로 볼지 지정해 주세요.")
+    return " ".join(lines)
+
+
 def _has_foreign_script(text: str) -> bool:
     return bool(re.search(r"[A-Za-z\u3040-\u30FF\u4E00-\u9FFF]", text))
 
 
 def _build_fallback_response(summary: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
-    t_e = evidence.get("t_test")
-    c_e = evidence.get("correlation")
+    recommended = _choose_primary_method("", evidence)
+    method_options = _build_method_options(evidence)
 
-    if t_e:
-        sig = "통계적으로 유의미" if t_e["p_value"] < 0.05 else "통계적으로 유의미하지 않음"
-        recommended = "T-검정"
+    c_e = evidence.get("correlation")
+    r_e = evidence.get("regression")
+    a_e = evidence.get("anova")
+    t_e = evidence.get("t_test")
+
+    if recommended == "상관분석" and c_e:
         explain = (
-            f"{t_e['group_col']}에 따른 {t_e['value_col']} 차이를 확인하기 위해 T-검정을 적용했습니다. "
-            f"{t_e['group_a']} 평균은 {t_e['mean_a']}, {t_e['group_b']} 평균은 {t_e['mean_b']}입니다. "
-            f"검정 결과 p값은 {t_e['p_value']}로 {sig}으로 해석됩니다. "
-            "해석 시 표본 수와 결측치 규모를 함께 점검하는 것이 좋습니다."
+            f"핵심 분석으로 상관분석을 권장합니다. {c_e['col_x']}와 {c_e['col_y']}의 상관계수는 "
+            f"r={c_e['r']}, p={c_e['p_value']}로 확인되었습니다. "
+            "변수 간 선형 관계를 빠르게 파악하고 후속 모델링의 방향을 정하는 데 유리합니다."
         )
-    elif c_e:
-        recommended = "상관분석"
+    elif recommended == "회귀분석" and r_e:
         explain = (
-            f"{c_e['col_x']}와 {c_e['col_y']}의 상관분석을 수행했습니다. "
-            f"상관계수 r은 {c_e['r']}이고 p값은 {c_e['p_value']}입니다. "
-            "상관의 크기와 방향을 기반으로 변수 간 관계를 해석할 수 있습니다. "
-            "다만 상관관계는 인과관계를 의미하지 않으므로 추가 검증이 필요합니다."
+            f"핵심 분석으로 회귀분석을 권장합니다. 목표변수는 {r_e['target']}이며, "
+            f"주요 설명변수는 {', '.join(r_e['features'])}입니다. "
+            "각 변수의 영향력을 동시에 확인하고 예측 모델을 구축할 수 있습니다."
+        )
+    elif recommended == "ANOVA" and a_e:
+        explain = (
+            f"핵심 분석으로 ANOVA를 권장합니다. {a_e['group_col']} 집단 간 {a_e['value_col']} 평균 차이를 비교했을 때 "
+            f"p={a_e['p_value']}로 확인되었습니다. 3개 이상 집단 비교에 적합합니다."
+        )
+    elif recommended == "T-검정" and t_e:
+        sig = "유의미" if t_e["p_value"] < 0.05 else "유의미하지 않음"
+        explain = (
+            f"핵심 분석으로 T-검정을 권장합니다. {t_e['group_col']}에 따른 {t_e['value_col']} 차이의 p값은 "
+            f"{t_e['p_value']}로 {sig}합니다. 2개 집단 비교 상황에서 해석이 명확합니다."
         )
     else:
-        recommended = "기술통계"
-        explain = "현재 데이터로는 기본 기술통계를 중심으로 분포, 결측치, 변수 구성을 먼저 점검하는 것이 적절합니다."
+        explain = "현재 데이터는 기술통계를 먼저 확인한 뒤 상관/회귀/집단비교 분석으로 확장하는 것이 적절합니다."
 
     insights = [
-        f"데이터는 총 {summary.get('row_count', 0)}행, {summary.get('column_count', 0)}열입니다.",
-        f"전체 결측치는 {summary.get('missing_total', 0)}개입니다.",
-        "의사결정 전에 유의확률과 효과크기를 함께 확인하세요.",
+        f"주 분석 추천: {recommended}",
+        "대안 분석 3개를 함께 제시했으니 목적(관계 파악/영향 추정/집단 비교)에 따라 선택할 수 있습니다.",
+        "원하면 지금 바로 대안 분석(상관/회귀/ANOVA/교차분석) 중 하나를 추가 실행할 수 있습니다.",
     ]
 
     return {
@@ -339,6 +588,8 @@ def _build_fallback_response(summary: dict[str, Any], evidence: dict[str, Any]) 
         "explanation": explain,
         "insights": insights,
         "chart_data": summary.get("chart_data", []),
+        "method_options": method_options,
+        "next_question": "추가로 상관분석, 회귀분석, ANOVA, 교차분석 중 어떤 분석을 먼저 실행할까요?",
     }
 
 
@@ -468,6 +719,91 @@ def get_report(report_id: int) -> dict[str, Any]:
         db.close()
 
 
+@app.patch("/reports/{report_id}")
+def update_report(report_id: int, payload: ReportUpdateRequest) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        row = db.query(AnalysisReportModel).filter(AnalysisReportModel.id == report_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="리포트를 찾을 수 없습니다.")
+
+        if payload.file_name is not None:
+            new_name = payload.file_name.strip()
+            if not new_name:
+                raise HTTPException(status_code=400, detail="파일명은 비워둘 수 없습니다.")
+            row.file_name = new_name
+
+        db.commit()
+        db.refresh(row)
+        return _serialize_report(row)
+    finally:
+        db.close()
+
+
+@app.delete("/reports/{report_id}")
+def delete_report(report_id: int) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        row = db.query(AnalysisReportModel).filter(AnalysisReportModel.id == report_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="리포트를 찾을 수 없습니다.")
+        db.delete(row)
+        db.commit()
+        return {"status": "success", "deleted_id": report_id}
+    finally:
+        db.close()
+
+
+@app.post("/assistant/ask")
+def assistant_ask(payload: AssistantAskRequest) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        row = db.query(AnalysisReportModel).filter(AnalysisReportModel.id == payload.report_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="리포트를 찾을 수 없습니다.")
+
+        report = _serialize_report(row)
+        use_llm = os.environ.get("DATALENS_USE_LLM", "0") == "1"
+
+        if use_llm:
+            try:
+                prompt = {
+                    "question": payload.question,
+                    "report": {
+                        "recommended_method": report.get("recommended_method"),
+                        "explanation": report.get("explanation"),
+                        "insights": report.get("insights"),
+                        "summary": report.get("summary"),
+                        "evidence": report.get("evidence"),
+                    },
+                }
+                response = ollama.chat(
+                    model="llama3.2",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "너는 분석 결과를 쉽게 설명하는 한국어 어시스턴트다. 제공된 보고서 내용만 근거로 3~5문장으로 간결하게 답해라.",
+                        },
+                        {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                    ],
+                )
+                answer = response["message"]["content"]
+                if _has_foreign_script(answer):
+                    answer = _assistant_fallback_answer(report, payload.question)
+            except Exception:
+                answer = _assistant_fallback_answer(report, payload.question)
+        else:
+            answer = _assistant_fallback_answer(report, payload.question)
+
+        return {
+            "status": "success",
+            "report_id": payload.report_id,
+            "answer": answer,
+        }
+    finally:
+        db.close()
+
+
 @app.post("/analyze")
 def analyze(
     file: UploadFile = File(...),
@@ -489,12 +825,22 @@ def analyze(
     else:
         llm = _build_fallback_response(summary, evidence)
 
+    method_options = llm.get("method_options")
+    if not isinstance(method_options, list) or not method_options:
+        method_options = _build_method_options(evidence)
+
+    next_question = llm.get("next_question")
+    if not isinstance(next_question, str) or not next_question.strip():
+        next_question = "추가로 상관분석, 회귀분석, ANOVA, 교차분석 중 어떤 분석을 먼저 실행할까요?"
+
     payload = {
         "status": "success",
         "recommended_method": llm.get("recommended_method", "기술통계"),
         "explanation": llm.get("explanation", "분석 설명을 생성하지 못했습니다."),
         "insights": llm.get("insights", []),
         "chart_data": llm.get("chart_data", summary.get("chart_data", [])),
+        "method_options": method_options,
+        "next_question": next_question,
         "table_data": summary.get("columns", []),
         "summary": {
             "row_count": summary.get("row_count", 0),
