@@ -15,6 +15,33 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 app = FastAPI(title="Data Lens API", version="1.0.0")
 
+
+def _build_origins() -> list[str]:
+    origins = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://sw-cap2.s3-website.ap-northeast-2.amazonaws.com",
+        "https://d2pqx6mndt1m20.cloudfront.net",
+    ]
+
+    # Optional production origins (set on EC2 environment)
+    s3_origin = os.environ.get("FRONTEND_S3_ORIGIN", "").strip()
+    cloudfront_origin = os.environ.get("FRONTEND_CLOUDFRONT_ORIGIN", "").strip()
+    extra_origins_raw = os.environ.get("FRONTEND_ORIGINS", "").strip()
+
+    if s3_origin:
+        origins.append(s3_origin)
+    if cloudfront_origin:
+        origins.append(cloudfront_origin)
+    if extra_origins_raw:
+        origins.extend([o.strip() for o in extra_origins_raw.split(",") if o.strip()])
+
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(origins))
+
+
+origins = _build_origins()
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./datalens.db")
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
 ENGINE = create_engine(
@@ -45,7 +72,7 @@ Base.metadata.create_all(bind=ENGINE)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
