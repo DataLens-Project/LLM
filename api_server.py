@@ -597,8 +597,244 @@ def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
     return evidence
 
 
+def _normalize_method_name(method: str) -> str:
+    m = (method or "").lower()
+    if "anova" in m or "분산분석" in m:
+        return "ANOVA"
+    if "t-검정" in m or "t 검정" in m or "ttest" in m or "t-test" in m:
+        return "T-검정"
+    if "회귀" in m or "regression" in m or "predict" in m or "예측" in m:
+        return "회귀분석"
+    if "상관" in m or "correlation" in m or "관계" in m:
+        return "상관분석"
+    if "chi" in m or "카이" in m or "교차" in m:
+        return "교차분석"
+    return method or "기술통계"
+
+
+def _compute_method_scores(evidence: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    scores: dict[str, dict[str, Any]] = {}
+
+    corr = evidence.get("correlation")
+    if corr:
+        p_bonus = 15 if corr.get("p_value", 1) < 0.05 else 0
+        base = min(100.0, abs(float(corr.get("r", 0))) * 100 + p_bonus)
+        scores["상관분석"] = {
+            "score": round(base, 1),
+            "reason": f"r={corr.get('r')}, p={corr.get('p_value')}",
+        }
+    else:
+        scores["상관분석"] = {"score": 0.0, "reason": "유효한 수치형 변수쌍 부족"}
+
+    reg = evidence.get("regression")
+    if reg:
+        n_feat = len(reg.get("features", []))
+        base = min(100.0, 45 + n_feat * 15)
+        scores["회귀분석"] = {
+            "score": round(base, 1),
+            "reason": f"target={reg.get('target')}, features={', '.join(reg.get('features', []))}",
+        }
+    else:
+        scores["회귀분석"] = {"score": 0.0, "reason": "타깃/설명변수 후보 부족"}
+
+    anova = evidence.get("anova")
+    if anova:
+        p_bonus = 15 if anova.get("p_value", 1) < 0.05 else 0
+        base = min(100.0, float(anova.get("eta_squared", 0)) * 100 + p_bonus)
+        scores["ANOVA"] = {
+            "score": round(base, 1),
+            "reason": f"eta²={anova.get('eta_squared')}, p={anova.get('p_value')}",
+        }
+    else:
+        scores["ANOVA"] = {"score": 0.0, "reason": "3개 이상 유효 집단 비교 근거 부족"}
+
+    t_e = evidence.get("t_test")
+    if t_e:
+        p_bonus = 15 if t_e.get("p_value", 1) < 0.05 else 0
+        base = min(100.0, abs(float(t_e.get("cohen_d", 0))) * 100 + p_bonus)
+        scores["T-검정"] = {
+            "score": round(base, 1),
+            "reason": f"d={t_e.get('cohen_d')}, p={t_e.get('p_value')}",
+        }
+    else:
+        scores["T-검정"] = {"score": 0.0, "reason": "2개 집단 비교 근거 부족"}
+
+    chi = evidence.get("chi_square")
+    if chi:
+        # effect size가 없어도 p-value와 유효 테이블 존재 여부로 기본 점수 부여
+        p_bonus = 15 if chi.get("p_value", 1) < 0.05 else 5
+        base = min(100.0, 45 + p_bonus)
+        scores["교차분석"] = {
+            "score": round(base, 1),
+            "reason": f"chi2={chi.get('chi2')}, p={chi.get('p_value')}",
+        }
+    else:
+        scores["교차분석"] = {"score": 0.0, "reason": "유효한 범주형 변수쌍 부족"}
+
+    return scores
+
+
+def _build_method_visualization(
+    df: pd.DataFrame,
+    evidence: dict[str, Any],
+    method: str,
+    default_chart_data: list[dict[str, Any]],
+) -> dict[str, Any]:
+    method_norm = _normalize_method_name(method)
+
+    def _with_fallback(meta_title: str, meta_desc: str) -> dict[str, Any]:
+        return {
+            "chart_data": default_chart_data,
+            "secondary_chart_data": [],
+            "chart_meta": {
+                "mode": "numeric_profile",
+                "primary_chart": "bar",
+                "secondary_chart": "line",
+                "title": meta_title,
+                "secondary_title": "추세 분석",
+                "description": meta_desc,
+                "value_key": "value",
+            },
+        }
+
+    if method_norm in ["ANOVA", "T-검정"] and isinstance(evidence.get("group_metric"), dict):
+        gm = evidence.get("group_metric")
+        return {
+            "chart_data": default_chart_data,
+            "secondary_chart_data": [
+                {
+                    "category": str(r.get("category")),
+                    "value": float(r.get("raw_mean", r.get("value", 0))),
+                }
+                for r in default_chart_data
+            ],
+            "chart_meta": {
+                "mode": "group_compare",
+                "primary_chart": "bar",
+                "secondary_chart": "line",
+                "title": f"{gm.get('group_col')}별 {gm.get('value_col')} 평균 비교",
+                "secondary_title": "그룹 평균 추세",
+                "description": f"{gm.get('group_col')} 집단별 {gm.get('value_col')} 평균을 비교합니다.",
+                "value_key": "raw_mean",
+            },
+        }
+
+    if method_norm == "상관분석" and isinstance(evidence.get("correlation"), dict):
+        corr = evidence.get("correlation")
+        x_col = corr.get("col_x")
+        y_col = corr.get("col_y")
+        if x_col in df.columns and y_col in df.columns:
+            sub = df[[x_col, y_col]].dropna()
+            if len(sub) >= 30:
+                n_bins = min(8, max(4, int(len(sub) ** 0.5 // 2)))
+                try:
+                    sub = sub.copy()
+                    sub["_bin"] = pd.qcut(sub[x_col], q=n_bins, duplicates="drop")
+                    grouped = sub.groupby("_bin", observed=True)[y_col].mean().reset_index()
+                    grouped = grouped.rename(columns={y_col: "raw_mean"})
+                    rows = []
+                    for i, row in grouped.iterrows():
+                        raw = float(row["raw_mean"])
+                        rows.append({"category": f"Q{i+1}", "value": round(raw, 3), "raw_mean": round(raw, 3)})
+                    return {
+                        "chart_data": rows,
+                        "secondary_chart_data": rows,
+                        "chart_meta": {
+                            "mode": "correlation_curve",
+                            "primary_chart": "line",
+                            "secondary_chart": "bar",
+                            "title": f"{x_col} 구간별 {y_col} 평균 추세",
+                            "secondary_title": "구간 평균 비교",
+                            "description": f"상관 강도(r={corr.get('r')})가 큰 변수쌍의 구간별 평균 패턴입니다.",
+                            "value_key": "raw_mean",
+                        },
+                    }
+                except Exception:
+                    pass
+
+    if method_norm == "회귀분석" and isinstance(evidence.get("regression"), dict):
+        reg = evidence.get("regression")
+        target = reg.get("target")
+        features = reg.get("features", [])
+        if target in df.columns and isinstance(features, list) and features:
+            rows = []
+            for f in features:
+                if f not in df.columns:
+                    continue
+                sub = df[[target, f]].dropna()
+                if len(sub) < 30:
+                    continue
+                r, _ = stats.pearsonr(sub[target], sub[f])
+                strength = abs(float(r))
+                rows.append(
+                    {
+                        "category": str(f),
+                        "value": round(strength * 100, 2),
+                        "raw_mean": round(strength, 3),
+                    }
+                )
+
+            if rows:
+                rows = sorted(rows, key=lambda x: x["value"], reverse=True)
+                return {
+                    "chart_data": rows,
+                    "secondary_chart_data": rows,
+                    "chart_meta": {
+                        "mode": "regression_importance",
+                        "primary_chart": "bar",
+                        "secondary_chart": "line",
+                        "title": f"{target} 예측 영향도(상관강도 기반)",
+                        "secondary_title": "영향도 추세",
+                        "description": "설명변수별 타깃 연관 강도(절대 상관계수)를 기준으로 정렬했습니다.",
+                        "value_key": "value",
+                    },
+                }
+
+    if method_norm == "교차분석" and isinstance(evidence.get("chi_square"), dict):
+        chi = evidence.get("chi_square")
+        c1, c2 = chi.get("col1"), chi.get("col2")
+        if c1 in df.columns and c2 in df.columns:
+            sub = df[[c1, c2]].dropna()
+            if len(sub) >= 30:
+                tbl = pd.crosstab(sub[c1], sub[c2], normalize="index") * 100
+                if not tbl.empty:
+                    main_col = tbl.sum(axis=0).idxmax()
+                    rows = [
+                        {
+                            "category": str(idx),
+                            "value": round(float(tbl.loc[idx, main_col]), 2),
+                            "raw_mean": round(float(tbl.loc[idx, main_col]), 2),
+                        }
+                        for idx in tbl.index
+                    ]
+                    secondary = [
+                        {
+                            "category": str(col),
+                            "value": round(float(tbl[col].mean()), 2),
+                        }
+                        for col in tbl.columns
+                    ]
+                    return {
+                        "chart_data": rows,
+                        "secondary_chart_data": secondary,
+                        "chart_meta": {
+                            "mode": "categorical_association",
+                            "primary_chart": "bar",
+                            "secondary_chart": "bar",
+                            "title": f"{c1}별 {c2} 비율 비교",
+                            "secondary_title": f"{c2} 평균 비율",
+                            "description": f"교차분석의 기준 변수는 {c1}, 비교 변수는 {c2}입니다.",
+                            "value_key": "value",
+                        },
+                    }
+
+    return _with_fallback("변수 평균 비교", "데이터 특성상 기본 요약 시각화를 사용합니다.")
+
+
 def _build_method_options(evidence: dict[str, Any]) -> list[dict[str, str]]:
     options = []
+
+    scores = _compute_method_scores(evidence)
 
     corr = evidence.get("correlation")
     reg = evidence.get("regression")
@@ -610,7 +846,7 @@ def _build_method_options(evidence: dict[str, Any]) -> list[dict[str, str]]:
             "method": "상관분석 (Correlation)",
             "when_to_use": "두 수치형 변수 간 관계를 확인할 때",
             "current_fit": (
-                f"적합도 높음: {corr['col_x']}–{corr['col_y']} (r={corr['r']}, p={corr['p_value']})"
+                f"점수 {scores['상관분석']['score']}/100: {corr['col_x']}–{corr['col_y']} (r={corr['r']}, p={corr['p_value']})"
                 if corr else "적합도 중간: 수치형 변수가 충분하면 적용 가능"
             ),
         }
@@ -620,7 +856,7 @@ def _build_method_options(evidence: dict[str, Any]) -> list[dict[str, str]]:
             "method": "회귀분석 (Regression)",
             "when_to_use": "여러 요인이 목표 변수에 미치는 영향을 보고 예측할 때",
             "current_fit": (
-                f"적합도 높음: target={reg['target']}, features={', '.join(reg['features'])}"
+                f"점수 {scores['회귀분석']['score']}/100: target={reg['target']}, features={', '.join(reg['features'])}"
                 if reg else "적합도 중간: 수치형 변수 3개 이상이면 권장"
             ),
         }
@@ -630,7 +866,7 @@ def _build_method_options(evidence: dict[str, Any]) -> list[dict[str, str]]:
             "method": "분산분석 (ANOVA)",
             "when_to_use": "3개 이상 집단의 평균 차이를 비교할 때",
             "current_fit": (
-                f"적합도 높음: {anova['group_col']} vs {anova['value_col']} (p={anova['p_value']})"
+                f"점수 {scores['ANOVA']['score']}/100: {anova['group_col']} vs {anova['value_col']} (p={anova['p_value']})"
                 if anova else "적합도 중간: 3개 이상 집단 범주형 변수가 있으면 적용 가능"
             ),
         }
@@ -640,11 +876,19 @@ def _build_method_options(evidence: dict[str, Any]) -> list[dict[str, str]]:
             "method": "교차분석 (Chi-square)",
             "when_to_use": "범주형 변수 간 관련성을 볼 때",
             "current_fit": (
-                f"적합도 높음: {chi['col1']} vs {chi['col2']} (p={chi['p_value']})"
+                f"점수 {scores['교차분석']['score']}/100: {chi['col1']} vs {chi['col2']} (p={chi['p_value']})"
                 if chi else "적합도 중간: 범주형 변수 2개 이상이면 적용 가능"
             ),
         }
     )
+
+    method_key = {
+        "상관분석 (Correlation)": "상관분석",
+        "회귀분석 (Regression)": "회귀분석",
+        "분산분석 (ANOVA)": "ANOVA",
+        "교차분석 (Chi-square)": "교차분석",
+    }
+    options.sort(key=lambda x: float(scores[method_key[x["method"]]]["score"]), reverse=True)
 
     return options
 
@@ -670,17 +914,15 @@ def _choose_primary_method(question: str, evidence: dict[str, Any]) -> str:
         if evidence.get("t_test"):
             return "T-검정"
 
-    # 기본: 설명력이 큰 순서
-    if evidence.get("regression"):
-        return "회귀분석"
-    if evidence.get("correlation"):
-        return "상관분석"
-    if evidence.get("anova"):
-        return "ANOVA"
-    if evidence.get("t_test"):
-        return "T-검정"
-    if evidence.get("chi_square"):
-        return "교차분석"
+    # 기본: 근거 점수 최댓값
+    scores = _compute_method_scores(evidence)
+    ranked = sorted(
+        [(k, float(v.get("score", 0))) for k, v in scores.items()],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    if ranked and ranked[0][1] > 0:
+        return ranked[0][0]
     return "기술통계"
 
 
@@ -705,6 +947,8 @@ def _serialize_report(model: AnalysisReportModel) -> dict[str, Any]:
     table_data = _safe_json_load(model.table_data_json, [])
     summary = _safe_json_load(model.summary_json, {})
     evidence = _safe_json_load(model.evidence_json, {})
+    chart_meta = evidence.get("visualization") if isinstance(evidence, dict) else {}
+    secondary_chart_data = evidence.get("secondary_chart_data") if isinstance(evidence, dict) else []
     return {
         "id": model.id,
         "file_name": model.file_name,
@@ -716,6 +960,8 @@ def _serialize_report(model: AnalysisReportModel) -> dict[str, Any]:
         "table_data": table_data,
         "summary": summary,
         "evidence": evidence,
+        "chart_meta": chart_meta if isinstance(chart_meta, dict) else {},
+        "secondary_chart_data": secondary_chart_data if isinstance(secondary_chart_data, list) else [],
         "created_at": model.created_at.isoformat(),
     }
 
@@ -1076,9 +1322,20 @@ def analyze(
     else:
         llm = _build_fallback_response(summary, evidence, question)
 
-    method_options = llm.get("method_options")
-    if not isinstance(method_options, list) or not method_options:
-        method_options = _build_method_options(evidence)
+    recommended_method = _normalize_method_name(llm.get("recommended_method", "기술통계"))
+
+    # 질문/데이터에 맞는 기법별 시각화 번들 생성
+    viz_bundle = _build_method_visualization(
+        masked,
+        evidence,
+        recommended_method,
+        summary.get("chart_data", []),
+    )
+
+    method_options = _build_method_options(evidence)
+    evidence["method_scores"] = _compute_method_scores(evidence)
+    evidence["visualization"] = viz_bundle.get("chart_meta", {})
+    evidence["secondary_chart_data"] = viz_bundle.get("secondary_chart_data", [])
 
     next_question = llm.get("next_question")
     if not isinstance(next_question, str) or not next_question.strip():
@@ -1086,10 +1343,12 @@ def analyze(
 
     payload = {
         "status": "success",
-        "recommended_method": llm.get("recommended_method", "기술통계"),
+        "recommended_method": recommended_method,
         "explanation": llm.get("explanation", "분석 설명을 생성하지 못했습니다."),
         "insights": llm.get("insights", []),
-        "chart_data": llm.get("chart_data", summary.get("chart_data", [])),
+        "chart_data": viz_bundle.get("chart_data", summary.get("chart_data", [])),
+        "secondary_chart_data": viz_bundle.get("secondary_chart_data", []),
+        "chart_meta": viz_bundle.get("chart_meta", {}),
         "method_options": method_options,
         "next_question": next_question,
         "table_data": summary.get("columns", []),
