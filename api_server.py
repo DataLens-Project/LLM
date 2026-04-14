@@ -192,6 +192,30 @@ def _is_id_like_column(col_name: str, series: pd.Series) -> bool:
     return unique_ratio > 0.98
 
 
+def _is_categorical_candidate(col_name: str, series: pd.Series) -> bool:
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return False
+
+    nun = int(non_null.nunique())
+    if nun < 2:
+        return False
+
+    if _is_id_like_column(str(col_name), series):
+        return False
+
+    # 범주형 후보는 수준 수가 과도하지 않아야 함 (ID/고유키 열 제외)
+    max_levels = min(20, max(6, int(len(non_null) * 0.2)))
+    if nun > max_levels:
+        return False
+
+    unique_ratio = nun / max(len(non_null), 1)
+    if unique_ratio > 0.7:
+        return False
+
+    return True
+
+
 def _build_numeric_profile_chart_data(df: pd.DataFrame) -> list[dict[str, Any]]:
     numeric_cols = [
         c for c in df.columns
@@ -223,7 +247,7 @@ def _build_numeric_profile_chart_data(df: pd.DataFrame) -> list[dict[str, Any]]:
     return chart_data
 
 
-def _build_group_metric_chart_data(df: pd.DataFrame, evidence: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_group_metric_chart_data(df: pd.DataFrame, evidence: dict[str, Any]) -> dict[str, Any] | None:
     preferred_pairs = []
     if isinstance(evidence.get("anova"), dict):
         preferred_pairs.append((evidence["anova"].get("group_col"), evidence["anova"].get("value_col")))
@@ -236,11 +260,10 @@ def _build_group_metric_chart_data(df: pd.DataFrame, evidence: dict[str, Any]) -
         for c in df.columns:
             s = df[c]
             if pd.api.types.is_numeric_dtype(s):
-                if s.dropna().nunique() <= 12 and not _is_id_like_column(str(c), s):
+                if s.dropna().nunique() <= 12 and _is_categorical_candidate(str(c), s):
                     categorical_cols.append(c)
             else:
-                nun = s.dropna().nunique()
-                if 2 <= nun <= 12:
+                if _is_categorical_candidate(str(c), s):
                     categorical_cols.append(c)
 
         numeric_cols = [
@@ -323,9 +346,14 @@ def _build_group_metric_chart_data(df: pd.DataFrame, evidence: dict[str, Any]) -
         mn, mx = float(grouped["raw_mean"].min()), float(grouped["raw_mean"].max())
 
         rows: list[dict[str, Any]] = []
+        group_count = len(grouped)
         for _, row in grouped.iterrows():
             raw_mean = float(row["raw_mean"])
-            scaled = ((raw_mean - mn) / (mx - mn) * 100) if mx > mn else 50.0
+            # 2집단 비교에서 min-max 스케일은 0/100 극단값을 만들기 쉬워 상대비율 스케일 우선 사용
+            if group_count <= 2 and mx > 0 and mn >= 0:
+                scaled = (raw_mean / mx) * 100
+            else:
+                scaled = ((raw_mean - mn) / (mx - mn) * 100) if mx > mn else 50.0
             rows.append(
                 {
                     "category": str(row[gcol]),
@@ -333,9 +361,14 @@ def _build_group_metric_chart_data(df: pd.DataFrame, evidence: dict[str, Any]) -
                     "raw_mean": round(raw_mean, 3),
                 }
             )
-        return rows
+        return {
+            "chart_data": rows,
+            "group_col": str(gcol),
+            "value_col": str(vcol),
+            "n_groups": int(group_count),
+        }
 
-    return []
+    return None
 
 
 def _read_upload(file: UploadFile) -> pd.DataFrame:
@@ -413,10 +446,10 @@ def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
     for c in df.columns:
         s = df[c]
         if pd.api.types.is_numeric_dtype(s):
-            if s.dropna().nunique() <= 8 and not _is_id_like_column(str(c), s):
+            if s.dropna().nunique() <= 8 and _is_categorical_candidate(str(c), s):
                 categorical_cols.append(c)
         else:
-            if s.dropna().nunique() >= 2:
+            if _is_categorical_candidate(str(c), s):
                 categorical_cols.append(c)
 
     # 1) T-검정: 이진 집단 + 수치형 (효과크기 d가 큰 조합)
@@ -619,6 +652,14 @@ def _build_method_options(evidence: dict[str, Any]) -> list[dict[str, str]]:
 def _choose_primary_method(question: str, evidence: dict[str, Any]) -> str:
     q = (question or "").lower()
 
+    # 사용자가 기법을 명시하면 우선 존중
+    if any(k in q for k in ["anova", "분산분석"]):
+        return "ANOVA"
+    if any(k in q for k in ["t-검정", "t 검정", "ttest", "t-test"]):
+        return "T-검정"
+    if any(k in q for k in ["chi", "카이", "교차분석", "카이제곱"]):
+        return "교차분석"
+
     if any(k in q for k in ["예측", "영향", "회귀", "predict"]):
         return "회귀분석" if evidence.get("regression") else "상관분석"
     if any(k in q for k in ["관계", "상관", "correlation"]):
@@ -685,6 +726,39 @@ def _assistant_fallback_answer(report: dict[str, Any], question: str) -> str:
     insights = report.get("insights", [])
     summary = report.get("summary", {})
     evidence = report.get("evidence", {})
+    chart_data = report.get("chart_data", [])
+    q = (question or "").lower()
+
+    if isinstance(evidence, dict) and isinstance(evidence.get("group_metric"), dict) and isinstance(chart_data, list) and chart_data:
+        gm = evidence.get("group_metric")
+        group_col = gm.get("group_col")
+        value_col = gm.get("value_col")
+
+        rows = []
+        for r in chart_data:
+            if isinstance(r, dict) and "category" in r and "raw_mean" in r:
+                rows.append((str(r.get("category")), float(r.get("raw_mean"))))
+
+        if rows and any(k in q for k in ["성별", "남성", "여성", "그룹", "집단", "평균", "비교"]):
+            rows_sorted = sorted(rows, key=lambda x: x[1], reverse=True)
+            top_label, top_mean = rows_sorted[0]
+            bot_label, bot_mean = rows_sorted[-1]
+            diff = top_mean - bot_mean
+
+            male = next((v for k, v in rows if "남" in k), None)
+            female = next((v for k, v in rows if "여" in k), None)
+
+            lines = [
+                f"현재 리포트에서 그룹 기준은 {group_col}, 비교 지표는 {value_col}입니다.",
+                "그룹별 평균은 " + ", ".join([f"{k}={round(v, 3)}" for k, v in rows_sorted]) + " 입니다.",
+                f"최고 그룹은 {top_label}, 최저 그룹은 {bot_label}이며 평균 차이는 {round(diff, 3)}입니다.",
+            ]
+            if male is not None and female is not None:
+                sex_gap = female - male
+                direction = "여성이 더 높고" if sex_gap > 0 else "남성이 더 높고"
+                lines.append(f"성별 기준으로는 {direction} 평균 격차는 {round(abs(sex_gap), 3)}입니다.")
+            lines.append("원하면 같은 기준으로 t-검정/ANOVA 유의성까지 바로 해석해 드릴게요.")
+            return " ".join(lines)
 
     lines = [
         f"이번 분석의 핵심 기법은 {rec}입니다.",
@@ -707,8 +781,8 @@ def _has_foreign_script(text: str) -> bool:
     return bool(re.search(r"[A-Za-z\u3040-\u30FF\u4E00-\u9FFF]", text))
 
 
-def _build_fallback_response(summary: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
-    recommended = _choose_primary_method("", evidence)
+def _build_fallback_response(summary: dict[str, Any], evidence: dict[str, Any], question: str = "") -> dict[str, Any]:
+    recommended = _choose_primary_method(question, evidence)
     method_options = _build_method_options(evidence)
 
     c_e = evidence.get("correlation")
@@ -779,7 +853,7 @@ def _call_llama(question: str, summary: dict[str, Any], evidence: dict[str, Any]
     try:
         parsed = _extract_json(content)
     except Exception:
-        return _build_fallback_response(summary, evidence)
+        return _build_fallback_response(summary, evidence, question)
 
     if _has_foreign_script(parsed.get("explanation", "")):
         # 한국어 교정 1회 시도
@@ -796,10 +870,10 @@ def _call_llama(question: str, summary: dict[str, Any], evidence: dict[str, Any]
         try:
             parsed = _extract_json(rewrite["message"]["content"])
         except Exception:
-            return _build_fallback_response(summary, evidence)
+            return _build_fallback_response(summary, evidence, question)
 
     if _has_foreign_script(parsed.get("explanation", "")):
-        return _build_fallback_response(summary, evidence)
+        return _build_fallback_response(summary, evidence, question)
 
     chart_data = parsed.get("chart_data")
     if not isinstance(chart_data, list) or not chart_data:
@@ -807,7 +881,7 @@ def _call_llama(question: str, summary: dict[str, Any], evidence: dict[str, Any]
 
     insights = parsed.get("insights")
     if not isinstance(insights, list) or not insights:
-        parsed["insights"] = _build_fallback_response(summary, evidence)["insights"]
+        parsed["insights"] = _build_fallback_response(summary, evidence, question)["insights"]
 
     return parsed
 
@@ -939,6 +1013,8 @@ def assistant_ask(payload: AssistantAskRequest) -> dict[str, Any]:
                         "explanation": report.get("explanation"),
                         "insights": report.get("insights"),
                         "summary": report.get("summary"),
+                        "table_data": report.get("table_data"),
+                        "chart_data": report.get("chart_data"),
                         "evidence": report.get("evidence"),
                     },
                 }
@@ -947,7 +1023,7 @@ def assistant_ask(payload: AssistantAskRequest) -> dict[str, Any]:
                     messages=[
                         {
                             "role": "system",
-                            "content": "너는 분석 결과를 쉽게 설명하는 한국어 어시스턴트다. 제공된 보고서 내용만 근거로 3~5문장으로 간결하게 답해라.",
+                            "content": "너는 데이터 분석 어시스턴트다. 반드시 제공된 report JSON만 근거로 한국어로 답하라. 숫자를 말할 때는 report의 실제 수치를 인용하고, 없는 값은 추측하지 마라. 4~6문장으로 간결하게 답하라.",
                         },
                         {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
                     ],
@@ -983,7 +1059,12 @@ def analyze(
     # 그룹형 비교가 가능한 경우, 차트를 "열 평균"이 아닌 "그룹 평균" 기준으로 교체
     grouped_chart = _build_group_metric_chart_data(masked, evidence)
     if grouped_chart:
-        summary["chart_data"] = grouped_chart
+        summary["chart_data"] = grouped_chart["chart_data"]
+        evidence["group_metric"] = {
+            "group_col": grouped_chart["group_col"],
+            "value_col": grouped_chart["value_col"],
+            "n_groups": grouped_chart["n_groups"],
+        }
 
     use_llm = os.environ.get("DATALENS_USE_LLM", "0") == "1"
 
@@ -991,9 +1072,9 @@ def analyze(
         try:
             llm = _call_llama(question, summary, evidence)
         except Exception:
-            llm = _build_fallback_response(summary, evidence)
+            llm = _build_fallback_response(summary, evidence, question)
     else:
-        llm = _build_fallback_response(summary, evidence)
+        llm = _build_fallback_response(summary, evidence, question)
 
     method_options = llm.get("method_options")
     if not isinstance(method_options, list) or not method_options:
