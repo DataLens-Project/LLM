@@ -143,6 +143,201 @@ def _mask_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return masked
 
 
+def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    cleaned = df.copy()
+
+    # 헤더/문자열 공백 정리 + 빈 문자열을 결측으로 통일
+    cleaned.columns = [str(c).strip() for c in cleaned.columns]
+    cleaned = cleaned.replace(r"^\s*$", np.nan, regex=True)
+
+    # 완전히 비어 있는 행/열 제거
+    cleaned = cleaned.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
+    # 엑셀에서 흔히 생기는 Unnamed 열 제거
+    unnamed_cols = [c for c in cleaned.columns if str(c).lower().startswith("unnamed")]
+    if unnamed_cols:
+        cleaned = cleaned.drop(columns=unnamed_cols)
+
+    # object 열은 좌우 공백 제거 후 빈 문자열을 결측 처리
+    obj_cols = cleaned.select_dtypes(include=["object"]).columns
+    if len(obj_cols) > 0:
+        for c in obj_cols:
+            cleaned[c] = cleaned[c].map(lambda v: v.strip() if isinstance(v, str) else v)
+            cleaned[c] = cleaned[c].replace("", np.nan)
+
+    return cleaned
+
+
+def _is_id_like_column(col_name: str, series: pd.Series) -> bool:
+    name = col_name.lower()
+    if any(k in name for k in ["id", "idx", "code", "코드", "번호"]):
+        return True
+    non_null = series.dropna()
+    if len(non_null) == 0:
+        return False
+    # 소표본에서는 고유비율이 높아도 연속형 지표일 가능성이 커서 ID로 보지 않음
+    if len(non_null) < 30:
+        return False
+
+    if pd.api.types.is_numeric_dtype(non_null):
+        # 숫자형인데 소수 성분이 뚜렷하면 연속형 지표로 간주
+        as_float = pd.to_numeric(non_null, errors="coerce").dropna()
+        if len(as_float) == 0:
+            return False
+        frac = (as_float - np.floor(as_float)).abs().mean()
+        if frac > 1e-6:
+            return False
+
+    unique_ratio = non_null.nunique() / len(non_null)
+    return unique_ratio > 0.98
+
+
+def _build_numeric_profile_chart_data(df: pd.DataFrame) -> list[dict[str, Any]]:
+    numeric_cols = [
+        c for c in df.columns
+        if pd.api.types.is_numeric_dtype(df[c]) and not _is_id_like_column(str(c), df[c])
+    ]
+
+    chart_data_raw = []
+    for col in numeric_cols[:5]:
+        non_null = df[col].dropna()
+        if len(non_null) > 0:
+            chart_data_raw.append({"category": str(col), "raw_mean": float(non_null.mean())})
+
+    chart_data = []
+    if chart_data_raw:
+        means = [item["raw_mean"] for item in chart_data_raw]
+        mn, mx = min(means), max(means)
+        for item in chart_data_raw:
+            if mx > mn:
+                scaled = (item["raw_mean"] - mn) / (mx - mn) * 100
+            else:
+                scaled = 50.0
+            chart_data.append(
+                {
+                    "category": item["category"],
+                    "value": round(float(scaled), 2),
+                    "raw_mean": round(float(item["raw_mean"]), 3),
+                }
+            )
+    return chart_data
+
+
+def _build_group_metric_chart_data(df: pd.DataFrame, evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    preferred_pairs = []
+    if isinstance(evidence.get("anova"), dict):
+        preferred_pairs.append((evidence["anova"].get("group_col"), evidence["anova"].get("value_col")))
+    if isinstance(evidence.get("t_test"), dict):
+        preferred_pairs.append((evidence["t_test"].get("group_col"), evidence["t_test"].get("value_col")))
+
+    # 근거에서 집단/지표 쌍을 못 찾은 경우를 대비한 자동 탐색
+    if not preferred_pairs:
+        categorical_cols = []
+        for c in df.columns:
+            s = df[c]
+            if pd.api.types.is_numeric_dtype(s):
+                if s.dropna().nunique() <= 12 and not _is_id_like_column(str(c), s):
+                    categorical_cols.append(c)
+            else:
+                nun = s.dropna().nunique()
+                if 2 <= nun <= 12:
+                    categorical_cols.append(c)
+
+        numeric_cols = [
+            c for c in df.columns
+            if pd.api.types.is_numeric_dtype(df[c]) and not _is_id_like_column(str(c), df[c])
+        ]
+
+        if categorical_cols and numeric_cols:
+            group_name_keys = ["group", "그룹", "구분", "등급", "class", "cluster"]
+
+            def _group_col_score(col: Any) -> float:
+                s = df[col]
+                non_null = s.dropna()
+                nun = non_null.nunique()
+                if nun < 2 or nun > 12:
+                    return -1.0
+
+                score = 0.0
+                lowered = str(col).lower()
+                if any(k in lowered for k in group_name_keys):
+                    score += 10.0
+
+                # 범주 수준이 너무 많지 않고, 결측이 적을수록 우선
+                score += (1.0 - abs(4 - min(nun, 8)) / 8.0) * 2.0
+                score += (len(non_null) / max(len(df), 1)) * 2.0
+                return score
+
+            best_group = max(categorical_cols, key=_group_col_score)
+
+            metric_priority_keys = ["target", "타겟", "score", "점수", "매출", "sales", "revenue", "소득", "금액"]
+
+            prioritized_numeric = []
+            for key in metric_priority_keys:
+                for c in numeric_cols:
+                    if key in str(c).lower() and c not in prioritized_numeric:
+                        prioritized_numeric.append(c)
+
+            def _value_col_score(col: Any) -> float:
+                lowered = str(col).lower()
+                non_null = df[col].dropna()
+                if len(non_null) == 0:
+                    return -1.0
+                score = 0.0
+                if any(k in lowered for k in metric_priority_keys):
+                    score += 10.0
+                score += float(non_null.std()) / (abs(float(non_null.mean())) + 1.0)
+                score += len(non_null) / max(len(df), 1)
+                return score
+
+            if prioritized_numeric:
+                best_value = prioritized_numeric[0]
+            else:
+                best_value = max(numeric_cols, key=_value_col_score)
+            preferred_pairs.append((best_group, best_value))
+
+    for gcol, vcol in preferred_pairs:
+        if not gcol or not vcol:
+            continue
+        if gcol not in df.columns or vcol not in df.columns:
+            continue
+        if not pd.api.types.is_numeric_dtype(df[vcol]):
+            continue
+
+        sub = df[[gcol, vcol]].copy()
+        sub[gcol] = sub[gcol].astype("string").str.strip()
+        sub[gcol] = sub[gcol].replace({"": np.nan, "nan": np.nan, "None": np.nan, "<NA>": np.nan})
+        sub = sub.dropna(subset=[gcol, vcol])
+        if len(sub) == 0:
+            continue
+
+        group_n = sub[gcol].nunique()
+        if group_n < 2 or group_n > 12:
+            continue
+
+        grouped = sub.groupby(gcol, as_index=False)[vcol].mean().rename(columns={vcol: "raw_mean"})
+        if len(grouped) < 2:
+            continue
+
+        grouped = grouped.sort_values("raw_mean", ascending=False)
+        mn, mx = float(grouped["raw_mean"].min()), float(grouped["raw_mean"].max())
+
+        rows: list[dict[str, Any]] = []
+        for _, row in grouped.iterrows():
+            raw_mean = float(row["raw_mean"])
+            scaled = ((raw_mean - mn) / (mx - mn) * 100) if mx > mn else 50.0
+            rows.append(
+                {
+                    "category": str(row[gcol]),
+                    "value": round(float(scaled), 2),
+                    "raw_mean": round(raw_mean, 3),
+                }
+            )
+        return rows
+
+    return []
+
+
 def _read_upload(file: UploadFile) -> pd.DataFrame:
     filename = (file.filename or "").lower()
     raw = file.file.read()
@@ -151,9 +346,11 @@ def _read_upload(file: UploadFile) -> pd.DataFrame:
 
     try:
         if filename.endswith(".csv"):
-            return pd.read_csv(BytesIO(raw))
+            parsed = pd.read_csv(BytesIO(raw))
+            return _clean_dataframe(parsed)
         if filename.endswith(".xlsx") or filename.endswith(".xls"):
-            return pd.read_excel(BytesIO(raw))
+            parsed = pd.read_excel(BytesIO(raw))
+            return _clean_dataframe(parsed)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"파일 파싱 실패: {exc}") from exc
 
@@ -181,29 +378,7 @@ def _build_summary(df: pd.DataFrame) -> dict[str, Any]:
                 info["max"] = round(float(non_null.max()), 4)
         column_summaries.append(info)
 
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    chart_data_raw = []
-    for col in numeric_cols[:5]:
-        non_null = df[col].dropna()
-        if len(non_null) > 0:
-            chart_data_raw.append({"category": str(col), "raw_mean": float(non_null.mean())})
-
-    chart_data = []
-    if chart_data_raw:
-        means = [item["raw_mean"] for item in chart_data_raw]
-        mn, mx = min(means), max(means)
-        for item in chart_data_raw:
-            if mx > mn:
-                scaled = (item["raw_mean"] - mn) / (mx - mn) * 100
-            else:
-                scaled = 50.0
-            chart_data.append(
-                {
-                    "category": item["category"],
-                    "value": round(float(scaled), 2),
-                    "raw_mean": round(float(item["raw_mean"]), 3),
-                }
-            )
+    chart_data = _build_numeric_profile_chart_data(df)
 
     return {
         "row_count": int(rows),
@@ -223,22 +398,12 @@ def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
         "chi_square": None,
     }
 
-    def is_id_like(col_name: str, series: pd.Series) -> bool:
-        name = col_name.lower()
-        if any(k in name for k in ["id", "idx", "code", "코드", "번호"]):
-            return True
-        non_null = series.dropna()
-        if len(non_null) == 0:
-            return False
-        unique_ratio = non_null.nunique() / len(non_null)
-        return unique_ratio > 0.98
-
     # 숫자형 중 연속형 후보만 사용(고유값이 너무 적은 컬럼 제외)
     numeric_cols = []
     for c in df.columns:
         if not pd.api.types.is_numeric_dtype(df[c]):
             continue
-        if is_id_like(str(c), df[c]):
+        if _is_id_like_column(str(c), df[c]):
             continue
         if df[c].dropna().nunique() <= 8:
             continue
@@ -248,7 +413,7 @@ def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
     for c in df.columns:
         s = df[c]
         if pd.api.types.is_numeric_dtype(s):
-            if s.dropna().nunique() <= 8 and not is_id_like(str(c), s):
+            if s.dropna().nunique() <= 8 and not _is_id_like_column(str(c), s):
                 categorical_cols.append(c)
         else:
             if s.dropna().nunique() >= 2:
@@ -814,6 +979,11 @@ def analyze(
     masked = _mask_dataframe(df)
     summary = _build_summary(masked)
     evidence = _compute_stat_evidence(masked)
+
+    # 그룹형 비교가 가능한 경우, 차트를 "열 평균"이 아닌 "그룹 평균" 기준으로 교체
+    grouped_chart = _build_group_metric_chart_data(masked, evidence)
+    if grouped_chart:
+        summary["chart_data"] = grouped_chart
 
     use_llm = os.environ.get("DATALENS_USE_LLM", "0") == "1"
 
