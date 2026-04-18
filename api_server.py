@@ -590,11 +590,19 @@ def _strip_particle(text: str) -> str:
     return cleaned.strip()
 
 
+def _cleanup_column_hint(col_hint: str) -> str:
+    cleaned = _strip_particle(col_hint or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"(컬럼|열|필드|부분|값|수치|데이터|항목)$", "", cleaned).strip()
+    return cleaned
+
+
 def _resolve_column_name(col_hint: str, columns: list[Any]) -> str | None:
     if not col_hint:
         return None
 
-    hint_norm = _normalize_text_token(_strip_particle(col_hint))
+    cleaned_hint = _cleanup_column_hint(col_hint)
+    hint_norm = _normalize_text_token(cleaned_hint)
     if not hint_norm:
         return None
 
@@ -641,6 +649,122 @@ def _build_numeric_filter_code(column: str, op: str, value: str, exclude_mode: b
     return (
         f"df = df[pd.to_numeric(df['{column}'], errors='coerce') {use_op} {value}]"
     )
+
+
+def _extract_decimal_places(command: str) -> int | None:
+    q = (command or "").strip()
+    if not q:
+        return None
+
+    if re.search(r"정수", q):
+        return 0
+
+    num_match = re.search(r"소수점\s*(?P<n>\d+)\s*(?:째|번째)?\s*자리", q)
+    if not num_match:
+        num_match = re.search(r"소수점\s*(?P<n>\d+)", q)
+    if not num_match:
+        num_match = re.search(r"(?P<n>\d+)\s*(?:째|번째)?\s*자리", q)
+    if num_match:
+        return int(num_match.group("n"))
+
+    word_match = re.search(
+        r"소수점\s*(?P<w>첫째|첫|한|하나|둘째|둘|두|셋째|세째|셋|세|넷째|네째|넷|네|다섯째|다섯|여섯째|여섯)\s*자리",
+        q,
+    )
+    if not word_match:
+        return None
+
+    word_to_num = {
+        "첫": 1,
+        "첫째": 1,
+        "한": 1,
+        "하나": 1,
+        "둘": 2,
+        "두": 2,
+        "둘째": 2,
+        "셋": 3,
+        "세": 3,
+        "셋째": 3,
+        "세째": 3,
+        "넷": 4,
+        "네": 4,
+        "넷째": 4,
+        "네째": 4,
+        "다섯": 5,
+        "다섯째": 5,
+        "여섯": 6,
+        "여섯째": 6,
+    }
+    return word_to_num.get(word_match.group("w"))
+
+
+def _build_round_code(command: str, df: pd.DataFrame) -> str | None:
+    q = (command or "").strip()
+    if not q:
+        return None
+
+    round_intent = bool(re.search(r"소수점|반올림|자리", q))
+    if not round_intent:
+        return None
+
+    places = _extract_decimal_places(q)
+    if places is None:
+        return None
+
+    places = max(0, min(10, int(places)))
+
+    col_hint_match = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:컬럼|열|필드|부분|값|수치)?\s*(?:을|를|은|는|의)?\s*(?:소수점|반올림)",
+        q,
+    )
+    col_hint = _cleanup_column_hint(col_hint_match.group("col")) if col_hint_match else ""
+
+    resolved_col = _resolve_column_name(col_hint, list(df.columns)) if col_hint else None
+    if not resolved_col and "점수" in q:
+        resolved_col = _resolve_column_name("점수", list(df.columns))
+
+    if not resolved_col:
+        return None
+
+    return (
+        "df = df.assign(**{" +
+        f"'{resolved_col}': pd.to_numeric(df['{resolved_col}'], errors='coerce').round({places})" +
+        "})"
+    )
+
+
+def _build_numeric_arithmetic_code(command: str, df: pd.DataFrame) -> str | None:
+    q = (command or "").strip()
+    if not q:
+        return None
+
+    op_match = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:값|수치)?\s*(?:을|를)?\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?P<op>더해|더해줘|증가|올려|빼|빼줘|감소|낮춰|곱해|곱해줘|곱하기|나눠|나눠줘|나누기)",
+        q,
+    )
+    if not op_match:
+        return None
+
+    col_hint = _cleanup_column_hint(op_match.group("col"))
+    resolved_col = _resolve_column_name(col_hint, list(df.columns))
+    if not resolved_col:
+        return None
+
+    value_raw = op_match.group("value")
+    op_token = op_match.group("op")
+
+    if op_token in ["더해", "더해줘", "증가", "올려"]:
+        expr = f"pd.to_numeric(df['{resolved_col}'], errors='coerce') + ({value_raw})"
+    elif op_token in ["빼", "빼줘", "감소", "낮춰"]:
+        expr = f"pd.to_numeric(df['{resolved_col}'], errors='coerce') - ({value_raw})"
+    elif op_token in ["곱해", "곱해줘", "곱하기"]:
+        expr = f"pd.to_numeric(df['{resolved_col}'], errors='coerce') * ({value_raw})"
+    else:
+        if float(value_raw) == 0.0:
+            raise ValueError("0으로 나누기는 허용되지 않습니다.")
+        expr = f"pd.to_numeric(df['{resolved_col}'], errors='coerce') / ({value_raw})"
+
+    return "df = df.assign(**{" + f"'{resolved_col}': {expr}" + "})"
 
 
 def _build_random_fillna_code(command: str, df: pd.DataFrame) -> str | None:
@@ -864,6 +988,14 @@ def _fallback_edit_code(command: str, df: pd.DataFrame) -> str:
     q = (command or "").strip()
     if not q:
         raise ValueError("수정 명령이 비어 있습니다.")
+
+    round_code = _build_round_code(q, df)
+    if round_code:
+        return round_code
+
+    arithmetic_code = _build_numeric_arithmetic_code(q, df)
+    if arithmetic_code:
+        return arithmetic_code
 
     random_fill = _build_random_fillna_code(q, df)
     if random_fill:
@@ -2232,8 +2364,7 @@ def analyze_session(payload: SessionAnalyzeRequest) -> dict[str, Any]:
     return analysis_payload
 
 
-@app.post("/session/edit")
-def edit_session(payload: SessionEditRequest) -> dict[str, Any]:
+def _apply_session_edit(payload: SessionEditRequest) -> tuple[dict[str, Any], str, str]:
     command = (payload.command or "").strip()
     if not command:
         raise HTTPException(status_code=400, detail="수정 명령은 비워둘 수 없습니다.")
@@ -2252,6 +2383,34 @@ def edit_session(payload: SessionEditRequest) -> dict[str, Any]:
     entry["df"] = updated_df
     entry["is_modified"] = True
     entry["updated_at"] = _utcnow()
+    return entry, code, command
+
+
+@app.post("/session/edit/quick")
+def edit_session_quick(payload: SessionEditRequest) -> dict[str, Any]:
+    entry, code, command = _apply_session_edit(payload)
+    df = entry["df"]
+
+    quick_payload: dict[str, Any] = {
+        "status": "success",
+        "session_id": payload.session_id,
+        "is_modified": True,
+        "applied_code": code,
+        "applied_command": command,
+        "summary": {
+            "row_count": int(len(df)),
+            "column_count": int(len(df.columns)),
+            "missing_total": int(df.isna().sum().sum()),
+        },
+    }
+    quick_payload.update(_build_session_grid_payload(entry))
+    return quick_payload
+
+
+@app.post("/session/edit")
+def edit_session(payload: SessionEditRequest) -> dict[str, Any]:
+    entry, code, command = _apply_session_edit(payload)
+    updated_df = entry["df"]
 
     file_name = str(entry.get("file_name") or "uploaded_file")
     analysis_question = (payload.question or "").strip()
