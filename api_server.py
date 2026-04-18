@@ -1763,6 +1763,10 @@ def _generate_analysis_payload(df: pd.DataFrame, file_name: str, question: str) 
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
+@app.get("/")
+async def root():
+    return {"message": "Data Lens API Server is running. " , "status": "ok"}
+
 
 @app.get("/reports")
 def list_reports(
