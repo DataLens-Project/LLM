@@ -155,7 +155,7 @@ def _env_int(name: str, default: int, min_value: int = 1) -> int:
         return default
 
 
-MAX_GRID_ROWS = _env_int("DATALENS_GRID_MAX_ROWS", 500)
+MAX_GRID_ROWS = _env_int("DATALENS_GRID_MAX_ROWS", 20000)
 SESSION_TTL_MINUTES = _env_int("DATALENS_SESSION_TTL_MINUTES", 180)
 DATAFRAME_SESSIONS: dict[str, dict[str, Any]] = {}
 
@@ -348,30 +348,61 @@ def _content_disposition(filename: str) -> str:
     return f"attachment; filename*=UTF-8''{quoted}"
 
 
+def _resolve_pdf_font() -> tuple[str, bool]:
+    """
+    Returns (font_name, supports_full_unicode).
+    """
+    from reportlab.pdfbase import pdfmetrics  # type: ignore[reportMissingImports]
+    from reportlab.pdfbase.ttfonts import TTFont  # type: ignore[reportMissingImports]
+
+    env_font_path = os.environ.get("DATALENS_PDF_FONT_PATH", "").strip()
+    candidate_paths = [
+        env_font_path,
+        os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic.ttf"),
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "C:/Windows/Fonts/malgun.ttf",
+    ]
+
+    for idx, path in enumerate(candidate_paths):
+        if not path:
+            continue
+        if not os.path.exists(path):
+            continue
+        try:
+            font_name = f"DLUnicodeFont{idx}"
+            pdfmetrics.registerFont(TTFont(font_name, path))
+            return font_name, True
+        except Exception:
+            continue
+
+    # CJK CID 폰트는 외부 TTF 없이도 한글 출력이 가능한 경우가 많아 서버 배포 환경에서 유용함
+    try:
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont  # type: ignore[reportMissingImports]
+
+        cid_name = "HYSMyeongJo-Medium"
+        pdfmetrics.registerFont(UnicodeCIDFont(cid_name))
+        return cid_name, True
+    except Exception:
+        return "Helvetica", False
+
+
 def _build_report_pdf_bytes(report: dict[str, Any]) -> bytes:
     try:
         from reportlab.lib.pagesizes import A4  # type: ignore[reportMissingImports]
         from reportlab.pdfgen import canvas  # type: ignore[reportMissingImports]
-        from reportlab.pdfbase import pdfmetrics  # type: ignore[reportMissingImports]
-        from reportlab.pdfbase.ttfonts import TTFont  # type: ignore[reportMissingImports]
     except Exception:
         # reportlab 미설치 환경에서도 다운로드 자체는 가능해야 하므로 최소 PDF로 폴백
         return _build_minimal_pdf_bytes(report)
 
-    preferred_font = "Helvetica"
-    korean_font_path = "C:/Windows/Fonts/malgun.ttf"
-    if os.path.exists(korean_font_path):
-        try:
-            pdfmetrics.registerFont(TTFont("MalgunGothic", korean_font_path))
-            preferred_font = "MalgunGothic"
-        except Exception:
-            preferred_font = "Helvetica"
+    preferred_font, full_unicode = _resolve_pdf_font()
 
     def _safe_text(text: Any) -> str:
         raw = str(text)
-        if preferred_font != "Helvetica":
+        if full_unicode:
             return raw
-        # 한글 폰트가 없으면 깨짐 방지를 위해 ASCII 치환
+        # 폰트 로딩 실패 시 최소한 PDF 생성은 유지하되 문자는 손상될 수 있음
         return raw.encode("ascii", "replace").decode("ascii")
 
     summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
