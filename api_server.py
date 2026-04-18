@@ -94,6 +94,11 @@ class SessionEditRequest(BaseModel):
     question: str | None = None
 
 
+class SessionResetRequest(BaseModel):
+    session_id: str
+    question: str | None = None
+
+
 Base.metadata.create_all(bind=ENGINE)
 
 app.add_middleware(
@@ -251,6 +256,7 @@ def _create_dataframe_session(file_name: str, df: pd.DataFrame) -> str:
     session_id = str(uuid.uuid4())
     DATAFRAME_SESSIONS[session_id] = {
         "file_name": file_name,
+        "original_df": df.copy(deep=True),
         "df": df.copy(deep=True),
         "is_modified": False,
         "updated_at": _utcnow(),
@@ -292,7 +298,7 @@ def _to_jsonable_value(value: Any) -> Any:
     return str(value)
 
 
-def _build_grid_payload(df: pd.DataFrame) -> dict[str, Any]:
+def _build_grid_payload(df: pd.DataFrame, prefix: str = "grid") -> dict[str, Any]:
     masked = _mask_dataframe(df)
     preview = masked.head(MAX_GRID_ROWS)
 
@@ -301,11 +307,28 @@ def _build_grid_payload(df: pd.DataFrame) -> dict[str, Any]:
         rows.append({str(col): _to_jsonable_value(val) for col, val in row.items()})
 
     return {
-        "grid_columns": [str(c) for c in masked.columns],
-        "grid_rows": rows,
-        "grid_row_count": int(len(masked)),
-        "grid_truncated": bool(len(masked) > MAX_GRID_ROWS),
+        f"{prefix}_columns": [str(c) for c in masked.columns],
+        f"{prefix}_rows": rows,
+        f"{prefix}_row_count": int(len(masked)),
+        f"{prefix}_truncated": bool(len(masked) > MAX_GRID_ROWS),
     }
+
+
+def _build_session_grid_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    edited_df = entry.get("df")
+    if not isinstance(edited_df, pd.DataFrame):
+        raise HTTPException(status_code=500, detail="세션 데이터가 손상되었습니다.")
+
+    original_df = entry.get("original_df")
+    if not isinstance(original_df, pd.DataFrame):
+        original_df = edited_df.copy(deep=True)
+        entry["original_df"] = original_df
+
+    payload: dict[str, Any] = {}
+    payload.update(_build_grid_payload(edited_df, prefix="grid"))
+    payload.update(_build_grid_payload(original_df, prefix="original_grid"))
+    payload.update(_build_grid_payload(edited_df, prefix="edited_grid"))
+    return payload
 
 
 def _safe_filename(raw_name: str, default_stem: str = "datalens") -> str:
@@ -331,11 +354,9 @@ def _build_report_pdf_bytes(report: dict[str, Any]) -> bytes:
         from reportlab.pdfgen import canvas  # type: ignore[reportMissingImports]
         from reportlab.pdfbase import pdfmetrics  # type: ignore[reportMissingImports]
         from reportlab.pdfbase.ttfonts import TTFont  # type: ignore[reportMissingImports]
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail="PDF 생성을 위한 reportlab 패키지가 필요합니다. requirements 설치 후 다시 시도해 주세요.",
-        ) from exc
+    except Exception:
+        # reportlab 미설치 환경에서도 다운로드 자체는 가능해야 하므로 최소 PDF로 폴백
+        return _build_minimal_pdf_bytes(report)
 
     preferred_font = "Helvetica"
     korean_font_path = "C:/Windows/Fonts/malgun.ttf"
@@ -406,6 +427,76 @@ def _build_report_pdf_bytes(report: dict[str, Any]) -> bytes:
     c.save()
     buf.seek(0)
     return buf.read()
+
+
+def _build_minimal_pdf_bytes(report: dict[str, Any]) -> bytes:
+    summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+    insights = report.get("insights", []) if isinstance(report.get("insights"), list) else []
+
+    lines = [
+        "Data Lens Analysis Report",
+        f"Report ID: {report.get('id', '-')}",
+        f"File: {report.get('file_name', '-')}",
+        f"Recommended Method: {report.get('recommended_method', '-')}",
+        f"Rows: {summary.get('row_count', 0)}",
+        f"Columns: {summary.get('column_count', 0)}",
+        f"Missing Total: {summary.get('missing_total', 0)}",
+        "",
+        "Explanation:",
+        str(report.get("explanation", "")),
+        "",
+        "Insights:",
+    ]
+    for idx, insight in enumerate(insights[:10], start=1):
+        lines.append(f"{idx}. {insight}")
+
+    def _to_ascii(text: str) -> str:
+        return str(text).encode("ascii", "replace").decode("ascii")
+
+    def _pdf_escape(text: str) -> str:
+        return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    content_parts = ["BT", "/F1 10 Tf", "40 800 Td"]
+    for line in lines:
+        safe = _pdf_escape(_to_ascii(line))
+        content_parts.append(f"({safe}) Tj")
+        content_parts.append("0 -14 Td")
+    content_parts.append("ET")
+    stream_data = "\n".join(content_parts).encode("latin-1", errors="replace")
+
+    objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        (
+            f"5 0 obj\n<< /Length {len(stream_data)} >>\nstream\n".encode("latin-1")
+            + stream_data
+            + b"\nendstream\nendobj\n"
+        ),
+    ]
+
+    header = b"%PDF-1.4\n"
+    body = b""
+    offsets = [0]
+    cursor = len(header)
+    for obj in objects:
+        offsets.append(cursor)
+        body += obj
+        cursor += len(obj)
+
+    xref_start = len(header) + len(body)
+    xref = f"xref\n0 {len(objects) + 1}\n".encode("latin-1")
+    xref += b"0000000000 65535 f \n"
+    for off in offsets[1:]:
+        xref += f"{off:010d} 00000 n \n".encode("latin-1")
+
+    trailer = (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n".encode(
+            "latin-1"
+        )
+    )
+    return header + body + xref + trailer
 
 
 def _build_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -479,6 +570,94 @@ def _build_numeric_filter_code(column: str, op: str, value: str, exclude_mode: b
     use_op = _invert_op(op) if exclude_mode else op
     return (
         f"df = df[pd.to_numeric(df['{column}'], errors='coerce') {use_op} {value}]"
+    )
+
+
+def _build_random_fillna_code(command: str, df: pd.DataFrame) -> str | None:
+    q = (command or "").strip()
+    if not q:
+        return None
+
+    random_intent = bool(re.search(r"무작위|랜덤|random", q, flags=re.IGNORECASE))
+    fill_intent = bool(re.search(r"채워|넣어|집어|대체|입력|보정", q))
+    missing_intent = bool(re.search(r"없는|결측|빈값|누락", q))
+
+    if not random_intent or not (fill_intent or missing_intent):
+        return None
+
+    col_hint_match = re.search(r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:가|이|의)?\s*(?:없는|결측|빈값|누락)", q)
+    col_hint = _strip_particle(col_hint_match.group("col")) if col_hint_match else ""
+
+    if "나이" in q and not col_hint:
+        col_hint = "나이"
+
+    resolved_col = _resolve_column_name(col_hint, list(df.columns)) if col_hint else None
+
+    if not resolved_col:
+        if "나이" in q:
+            age_like_candidates: list[str] = []
+            for c in df.columns:
+                num = pd.to_numeric(df[c], errors="coerce")
+                non_null = num.dropna()
+                if len(non_null) == 0:
+                    continue
+                if int(num.isna().sum()) <= 0:
+                    continue
+
+                min_v = float(non_null.min())
+                max_v = float(non_null.max())
+                is_integer_like = bool(np.all(np.isclose(non_null.values, np.round(non_null.values))))
+
+                # 일반적인 나이 분포(정수형, 0~120) 우선
+                if is_integer_like and min_v >= 0 and max_v <= 120:
+                    age_like_candidates.append(str(c))
+
+            if age_like_candidates:
+                resolved_col = age_like_candidates[0]
+
+    if not resolved_col:
+        candidates = []
+        for c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if int(s.isna().sum()) > 0:
+                candidates.append(str(c))
+        if candidates:
+            age_like = [c for c in candidates if "나이" in c]
+            resolved_col = age_like[0] if age_like else candidates[0]
+
+    if not resolved_col:
+        return None
+
+    max_match = re.search(r"(?:최대|맥스|max)\s*(?P<max>\d+(?:\.\d+)?)", q, flags=re.IGNORECASE)
+    if not max_match:
+        max_match = re.search(r"(?P<max>\d+(?:\.\d+)?)\s*세\s*까지", q)
+    min_match = re.search(r"(?:최소|min)\s*(?P<min>\d+(?:\.\d+)?)", q, flags=re.IGNORECASE)
+
+    max_val = float(max_match.group("max")) if max_match else 60.0
+    min_val = float(min_match.group("min")) if min_match else (1.0 if "나이" in resolved_col else 0.0)
+
+    if max_val <= min_val:
+        max_val = min_val + 1.0
+
+    numeric_series = pd.to_numeric(df[resolved_col], errors="coerce")
+    non_null = numeric_series.dropna()
+    integer_like = bool("나이" in resolved_col)
+    if len(non_null) > 0 and not integer_like:
+        integer_like = bool(np.all(np.isclose(non_null.values, np.round(non_null.values))))
+
+    if integer_like:
+        low = int(np.floor(min_val))
+        high_inclusive = int(np.floor(max_val))
+        if high_inclusive <= low:
+            high_inclusive = low + 1
+        random_expr = f"np.random.randint({low}, {high_inclusive + 1}, size=df.shape[0])"
+    else:
+        random_expr = f"np.random.uniform({float(min_val):.6f}, {float(max_val):.6f}, size=df.shape[0])"
+
+    return (
+        "df = df.assign(**{" +
+        f"'{resolved_col}': pd.to_numeric(df['{resolved_col}'], errors='coerce').where(pd.to_numeric(df['{resolved_col}'], errors='coerce').notna(), {random_expr})" +
+        "})"
     )
 
 
@@ -615,6 +794,10 @@ def _fallback_edit_code(command: str, df: pd.DataFrame) -> str:
     q = (command or "").strip()
     if not q:
         raise ValueError("수정 명령이 비어 있습니다.")
+
+    random_fill = _build_random_fillna_code(q, df)
+    if random_fill:
+        return random_fill
 
     numeric_filter = re.search(
         r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?P<op>이하|미만|이상|초과|<=|>=|<|>)\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?:인)?\s*(?:행|데이터|사람)?\s*(?P<action>제외|삭제|빼고|빼줘|제거|남겨|필터|유지)",
@@ -1953,7 +2136,7 @@ def analyze(
     payload = _generate_analysis_payload(df, file_name, question)
     payload["session_id"] = session_id
     payload["is_modified"] = False
-    payload.update(_build_grid_payload(df))
+    payload.update(_build_session_grid_payload(DATAFRAME_SESSIONS[session_id]))
 
     return payload
 
@@ -1966,7 +2149,7 @@ def analyze_session(payload: SessionAnalyzeRequest) -> dict[str, Any]:
     analysis_payload = _generate_analysis_payload(df, file_name, payload.question)
     analysis_payload["session_id"] = payload.session_id
     analysis_payload["is_modified"] = bool(entry.get("is_modified", False))
-    analysis_payload.update(_build_grid_payload(df))
+    analysis_payload.update(_build_session_grid_payload(entry))
     return analysis_payload
 
 
@@ -2001,7 +2184,33 @@ def edit_session(payload: SessionEditRequest) -> dict[str, Any]:
     analysis_payload["is_modified"] = True
     analysis_payload["applied_code"] = code
     analysis_payload["applied_command"] = command
-    analysis_payload.update(_build_grid_payload(updated_df))
+    analysis_payload.update(_build_session_grid_payload(entry))
+    return analysis_payload
+
+
+@app.post("/session/reset")
+def reset_session(payload: SessionResetRequest) -> dict[str, Any]:
+    entry = _get_dataframe_session(payload.session_id)
+
+    original_df = entry.get("original_df")
+    if not isinstance(original_df, pd.DataFrame):
+        original_df = entry["df"].copy(deep=True)
+        entry["original_df"] = original_df
+
+    entry["df"] = original_df.copy(deep=True)
+    entry["is_modified"] = False
+    entry["updated_at"] = _utcnow()
+
+    file_name = str(entry.get("file_name") or "uploaded_file")
+    question = (payload.question or "").strip()
+    if not question:
+        question = "수정 전 원본 데이터 상태로 복원 후 다시 분석해줘"
+
+    analysis_payload = _generate_analysis_payload(entry["df"], file_name, question)
+    analysis_payload["session_id"] = payload.session_id
+    analysis_payload["is_modified"] = False
+    analysis_payload["reset_done"] = True
+    analysis_payload.update(_build_session_grid_payload(entry))
     return analysis_payload
 
 
