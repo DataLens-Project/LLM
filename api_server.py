@@ -359,10 +359,19 @@ def _resolve_pdf_font() -> tuple[str, bool]:
     candidate_paths = [
         env_font_path,
         os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic.ttf"),
+        os.path.join(os.path.dirname(__file__), "fonts", "NotoSansKR-Regular.ttf"),
+        "/app/fonts/NanumGothic.ttf",
+        "/app/fonts/NotoSansKR-Regular.ttf",
         "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansKR-Regular.otf",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJKkr-Regular.otf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
         "C:/Windows/Fonts/malgun.ttf",
+        "C:/Windows/Fonts/gulim.ttc",
     ]
 
     for idx, path in enumerate(candidate_paths):
@@ -372,6 +381,8 @@ def _resolve_pdf_font() -> tuple[str, bool]:
             continue
         try:
             font_name = f"DLUnicodeFont{idx}"
+            if font_name in pdfmetrics.getRegisteredFontNames():
+                return font_name, True
             pdfmetrics.registerFont(TTFont(font_name, path))
             return font_name, True
         except Exception:
@@ -381,11 +392,39 @@ def _resolve_pdf_font() -> tuple[str, bool]:
     try:
         from reportlab.pdfbase.cidfonts import UnicodeCIDFont  # type: ignore[reportMissingImports]
 
-        cid_name = "HYSMyeongJo-Medium"
-        pdfmetrics.registerFont(UnicodeCIDFont(cid_name))
-        return cid_name, True
+        cid_candidates = [
+            "HYSMyeongJo-Medium",
+            "HYGoThic-Medium",
+            "HYGothic-Medium",
+            "HeiseiKakuGo-W5",
+            "HeiseiMin-W3",
+            "STSong-Light",
+            "MSung-Light",
+        ]
+        for cid_name in cid_candidates:
+            try:
+                if cid_name not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(UnicodeCIDFont(cid_name))
+                return cid_name, True
+            except Exception:
+                continue
     except Exception:
-        return "Helvetica", False
+        pass
+
+    return "Helvetica", False
+
+
+def _get_pdf_font_status() -> dict[str, Any]:
+    font_name, full_unicode = _resolve_pdf_font()
+    env_font_path = os.environ.get("DATALENS_PDF_FONT_PATH", "").strip()
+    env_font_exists = bool(env_font_path and os.path.exists(env_font_path))
+    return {
+        "font_name": font_name,
+        "full_unicode": full_unicode,
+        "env_font_path": env_font_path or None,
+        "env_font_exists": env_font_exists,
+        "using_fallback_helvetica": font_name == "Helvetica",
+    }
 
 
 def _build_report_pdf_bytes(report: dict[str, Any]) -> bytes:
@@ -1976,6 +2015,15 @@ def _generate_analysis_payload(df: pd.DataFrame, file_name: str, question: str) 
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/debug/pdf-font-status")
+def debug_pdf_font_status() -> dict[str, Any]:
+    status = _get_pdf_font_status()
+    return {
+        "status": "success",
+        **status,
+    }
 
 @app.get("/")
 async def root():
