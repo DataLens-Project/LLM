@@ -1,15 +1,19 @@
 import json
 import os
 import re
+import ast
+import uuid
 from io import BytesIO
+from urllib.parse import quote
 from typing import Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import ollama
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from scipy import stats
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
@@ -79,6 +83,17 @@ class AssistantAskRequest(BaseModel):
     question: str
 
 
+class SessionAnalyzeRequest(BaseModel):
+    session_id: str
+    question: str = "데이터의 핵심 인사이트를 설명해줘"
+
+
+class SessionEditRequest(BaseModel):
+    session_id: str
+    command: str
+    question: str | None = None
+
+
 Base.metadata.create_all(bind=ENGINE)
 
 app.add_middleware(
@@ -110,6 +125,51 @@ SYSTEM_PROMPT = """
 4) 개인정보(이름, 전화번호, 이메일, 주소)는 절대 출력 금지
 5) 설명은 보고서 톤으로 자연스럽고 문법적으로 정확하게 작성
 """.strip()
+
+EDIT_SYSTEM_PROMPT = """
+너는 Pandas 데이터 수정 전문가다.
+반드시 파이썬 코드 한 줄만 반환하라.
+
+규칙:
+1) 반드시 df 변수에 재할당하는 한 줄 코드만 출력 (예: df = df[df['나이'] > 20])
+2) import, 함수 정의, 반복문, 여러 줄 코드 금지
+3) 파일 입출력, 네트워크 호출, 시스템 명령 금지
+4) 컬럼명은 제공된 컬럼 목록만 사용
+5) 사용자가 삭제/제외를 요청하면 해당 조건을 제거하는 필터를 작성
+6) 한국어 설명 문장 없이 코드만 출력
+""".strip()
+
+
+def _env_int(name: str, default: int, min_value: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(min_value, int(raw))
+    except Exception:
+        return default
+
+
+MAX_GRID_ROWS = _env_int("DATALENS_GRID_MAX_ROWS", 500)
+SESSION_TTL_MINUTES = _env_int("DATALENS_SESSION_TTL_MINUTES", 180)
+DATAFRAME_SESSIONS: dict[str, dict[str, Any]] = {}
+
+_BANNED_CODE_PATTERNS = [
+    r"__",
+    r"\bimport\b",
+    r"\bopen\b",
+    r"\bexec\b",
+    r"\beval\b",
+    r"\bos\b",
+    r"\bsys\b",
+    r"\bsubprocess\b",
+    r"\bpathlib\b",
+    r"\bpickle\b",
+    r"\bread_(csv|excel|sql)\b",
+    r"\bto_(csv|excel|sql)\b",
+]
+
+_ALLOWED_NAME_IDS = {"df", "pd", "np", "True", "False", "None"}
 
 
 MASK_KEYWORDS = [
@@ -166,6 +226,486 @@ def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             cleaned[c] = cleaned[c].replace("", np.nan)
 
     return cleaned
+
+
+def _utcnow() -> datetime:
+    return datetime.utcnow()
+
+
+def _prune_sessions() -> None:
+    if not DATAFRAME_SESSIONS:
+        return
+    now = _utcnow()
+    expire_before = now - timedelta(minutes=SESSION_TTL_MINUTES)
+    stale_ids = [
+        sid
+        for sid, entry in DATAFRAME_SESSIONS.items()
+        if isinstance(entry.get("updated_at"), datetime) and entry["updated_at"] < expire_before
+    ]
+    for sid in stale_ids:
+        DATAFRAME_SESSIONS.pop(sid, None)
+
+
+def _create_dataframe_session(file_name: str, df: pd.DataFrame) -> str:
+    _prune_sessions()
+    session_id = str(uuid.uuid4())
+    DATAFRAME_SESSIONS[session_id] = {
+        "file_name": file_name,
+        "df": df.copy(deep=True),
+        "is_modified": False,
+        "updated_at": _utcnow(),
+    }
+    return session_id
+
+
+def _get_dataframe_session(session_id: str) -> dict[str, Any]:
+    _prune_sessions()
+    entry = DATAFRAME_SESSIONS.get(session_id)
+    if not entry:
+        raise HTTPException(
+            status_code=404,
+            detail="데이터 세션을 찾을 수 없습니다. 파일을 다시 업로드해 주세요.",
+        )
+    entry["updated_at"] = _utcnow()
+    return entry
+
+
+def _to_jsonable_value(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _build_grid_payload(df: pd.DataFrame) -> dict[str, Any]:
+    masked = _mask_dataframe(df)
+    preview = masked.head(MAX_GRID_ROWS)
+
+    rows: list[dict[str, Any]] = []
+    for _, row in preview.iterrows():
+        rows.append({str(col): _to_jsonable_value(val) for col, val in row.items()})
+
+    return {
+        "grid_columns": [str(c) for c in masked.columns],
+        "grid_rows": rows,
+        "grid_row_count": int(len(masked)),
+        "grid_truncated": bool(len(masked) > MAX_GRID_ROWS),
+    }
+
+
+def _safe_filename(raw_name: str, default_stem: str = "datalens") -> str:
+    name = (raw_name or "").strip()
+    if not name:
+        name = default_stem
+
+    # Path separator/제어문자 제거
+    name = re.sub(r"[\\/:*?\"<>|]", "_", name)
+    name = re.sub(r"\s+", "_", name)
+    name = name.strip("._")
+    return name or default_stem
+
+
+def _content_disposition(filename: str) -> str:
+    quoted = quote(filename)
+    return f"attachment; filename*=UTF-8''{quoted}"
+
+
+def _build_report_pdf_bytes(report: dict[str, Any]) -> bytes:
+    try:
+        from reportlab.lib.pagesizes import A4  # type: ignore[reportMissingImports]
+        from reportlab.pdfgen import canvas  # type: ignore[reportMissingImports]
+        from reportlab.pdfbase import pdfmetrics  # type: ignore[reportMissingImports]
+        from reportlab.pdfbase.ttfonts import TTFont  # type: ignore[reportMissingImports]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF 생성을 위한 reportlab 패키지가 필요합니다. requirements 설치 후 다시 시도해 주세요.",
+        ) from exc
+
+    preferred_font = "Helvetica"
+    korean_font_path = "C:/Windows/Fonts/malgun.ttf"
+    if os.path.exists(korean_font_path):
+        try:
+            pdfmetrics.registerFont(TTFont("MalgunGothic", korean_font_path))
+            preferred_font = "MalgunGothic"
+        except Exception:
+            preferred_font = "Helvetica"
+
+    def _safe_text(text: Any) -> str:
+        raw = str(text)
+        if preferred_font != "Helvetica":
+            return raw
+        # 한글 폰트가 없으면 깨짐 방지를 위해 ASCII 치환
+        return raw.encode("ascii", "replace").decode("ascii")
+
+    summary = report.get("summary", {}) if isinstance(report.get("summary"), dict) else {}
+    insights = report.get("insights", []) if isinstance(report.get("insights"), list) else []
+    table_data = report.get("table_data", []) if isinstance(report.get("table_data"), list) else []
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    y = height - 48
+
+    def _line(text: str, font: str | None = None, size: int = 10, step: int = 16) -> None:
+        nonlocal y
+        if y < 50:
+            c.showPage()
+            y = height - 48
+        c.setFont(font or preferred_font, size)
+        c.drawString(36, y, _safe_text(text))
+        y -= step
+
+    title_font = "Helvetica-Bold" if preferred_font == "Helvetica" else preferred_font
+    _line("Data Lens Analysis Report", title_font, 14, 22)
+    _line(f"Report ID: {report.get('id', '-')}")
+    _line(f"File: {report.get('file_name', '-')}")
+    _line(f"Created At: {report.get('created_at', '-')}")
+    _line(f"Recommended Method: {report.get('recommended_method', '-')}")
+    _line("")
+
+    _line("Summary", title_font, 12, 18)
+    _line(f"Rows: {summary.get('row_count', 0)}")
+    _line(f"Columns: {summary.get('column_count', 0)}")
+    _line(f"Missing Total: {summary.get('missing_total', 0)}")
+    _line("")
+
+    _line("Explanation", title_font, 12, 18)
+    for chunk in _safe_text(report.get("explanation", "")).split("\n"):
+        _line(chunk)
+    _line("")
+
+    _line("Insights", title_font, 12, 18)
+    for idx, insight in enumerate(insights[:12], start=1):
+        _line(f"{idx}. {insight}")
+    _line("")
+
+    _line("Top Columns", title_font, 12, 18)
+    for col in table_data[:20]:
+        if not isinstance(col, dict):
+            continue
+        _line(
+            f"- {col.get('name', '-')}: dtype={col.get('dtype', '-')}, missing={col.get('missing', 0)}, unique={col.get('unique', '-')}, mean={col.get('mean', '-')}"
+        )
+
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+
+def _build_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="edited_data")
+    output.seek(0)
+    return output.read()
+
+
+def _normalize_text_token(text: str) -> str:
+    return re.sub(r"[\s_\-]", "", str(text).lower())
+
+
+def _strip_particle(text: str) -> str:
+    cleaned = text.strip()
+    for suffix in ["입니다", "이야", "이", "가", "은", "는", "을", "를", "도", "값"]:
+        if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    return cleaned.strip()
+
+
+def _resolve_column_name(col_hint: str, columns: list[Any]) -> str | None:
+    if not col_hint:
+        return None
+
+    hint_norm = _normalize_text_token(_strip_particle(col_hint))
+    if not hint_norm:
+        return None
+
+    exact = [str(c) for c in columns if _normalize_text_token(str(c)) == hint_norm]
+    if exact:
+        return exact[0]
+
+    contains = [str(c) for c in columns if hint_norm in _normalize_text_token(str(c))]
+    if contains:
+        return contains[0]
+
+    reverse_contains = [str(c) for c in columns if _normalize_text_token(str(c)) in hint_norm]
+    if reverse_contains:
+        return reverse_contains[0]
+
+    return None
+
+
+def _invert_op(op: str) -> str:
+    return {
+        "<": ">=",
+        "<=": ">",
+        ">": "<=",
+        ">=": "<",
+    }.get(op, op)
+
+
+def _normalize_comp_op(op: str) -> str:
+    mapping = {
+        "이하": "<=",
+        "미만": "<",
+        "이상": ">=",
+        "초과": ">",
+        "<": "<",
+        "<=": "<=",
+        ">": ">",
+        ">=": ">=",
+    }
+    return mapping.get(op.strip(), op.strip())
+
+
+def _build_numeric_filter_code(column: str, op: str, value: str, exclude_mode: bool) -> str:
+    use_op = _invert_op(op) if exclude_mode else op
+    return (
+        f"df = df[pd.to_numeric(df['{column}'], errors='coerce') {use_op} {value}]"
+    )
+
+
+def _guess_category_filter_code(token: str, df: pd.DataFrame) -> str | None:
+    token = _strip_particle(token)
+    if not token:
+        return None
+
+    synonyms = {
+        "여성": "여",
+        "남성": "남",
+    }
+    candidates = [token]
+    if token in synonyms:
+        candidates.append(synonyms[token])
+
+    best: tuple[str, str] | None = None
+    for col in df.columns:
+        series = df[col]
+        if pd.api.types.is_numeric_dtype(series):
+            continue
+        uniques = [str(v).strip() for v in series.dropna().unique()[:200]]
+        for cand in candidates:
+            for uv in uniques:
+                if not uv:
+                    continue
+                uv_norm = _normalize_text_token(uv)
+                cand_norm = _normalize_text_token(cand)
+                if cand_norm == uv_norm or cand_norm in uv_norm or uv_norm in cand_norm:
+                    best = (str(col), uv)
+                    break
+            if best:
+                break
+        if best:
+            break
+
+    if not best:
+        return None
+
+    col, val = best
+    return f"df = df[df['{col}'].astype('string').str.strip() == '{val}']"
+
+
+def _extract_python_line(text: str) -> str:
+    cleaned = re.sub(r"```(?:python)?", "", text).strip()
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError("모델 응답에서 코드를 찾을 수 없습니다.")
+    code = lines[0]
+    if code.startswith("json") and len(lines) > 1:
+        code = lines[1]
+    return code.strip()
+
+
+def _validate_edit_code(code: str) -> str:
+    if not isinstance(code, str):
+        raise ValueError("수정 코드는 문자열이어야 합니다.")
+
+    cleaned = code.strip()
+    if not cleaned:
+        raise ValueError("빈 수정 코드는 허용되지 않습니다.")
+    if "\n" in cleaned or ";" in cleaned:
+        raise ValueError("수정 코드는 반드시 한 줄이어야 합니다.")
+    if not cleaned.startswith("df ="):
+        raise ValueError("수정 코드는 반드시 df에 재할당해야 합니다.")
+
+    lowered = cleaned.lower()
+    for pattern in _BANNED_CODE_PATTERNS:
+        if re.search(pattern, lowered):
+            raise ValueError("허용되지 않는 코드 패턴이 포함되어 있습니다.")
+
+    try:
+        tree = ast.parse(cleaned, mode="exec")
+    except Exception as exc:
+        raise ValueError(f"코드 구문 오류: {exc}") from exc
+
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
+        raise ValueError("단일 할당문만 허용됩니다.")
+
+    assign_stmt = tree.body[0]
+    if len(assign_stmt.targets) != 1 or not isinstance(assign_stmt.targets[0], ast.Name):
+        raise ValueError("df 단일 재할당만 허용됩니다.")
+    if assign_stmt.targets[0].id != "df":
+        raise ValueError("좌변 변수는 반드시 df여야 합니다.")
+
+    blocked_nodes = (
+        ast.Import,
+        ast.ImportFrom,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.For,
+        ast.While,
+        ast.With,
+        ast.Try,
+        ast.Raise,
+        ast.Lambda,
+        ast.Delete,
+        ast.Global,
+        ast.Nonlocal,
+    )
+
+    for node in ast.walk(tree):
+        if isinstance(node, blocked_nodes):
+            raise ValueError("허용되지 않는 코드 구조가 포함되어 있습니다.")
+        if isinstance(node, ast.Name) and node.id not in _ALLOWED_NAME_IDS:
+            raise ValueError(f"허용되지 않은 식별자 사용: {node.id}")
+        if isinstance(node, ast.Attribute) and str(node.attr).startswith("__"):
+            raise ValueError("dunder 속성 접근은 허용되지 않습니다.")
+
+    return cleaned
+
+
+def _execute_edit_code(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    validated = _validate_edit_code(code)
+    local_scope: dict[str, Any] = {
+        "df": df.copy(deep=True),
+        "pd": pd,
+        "np": np,
+    }
+    try:
+        exec(validated, {"__builtins__": {}}, local_scope)
+    except Exception as exc:
+        raise ValueError(f"코드 실행 실패: {exc}") from exc
+
+    result_df = local_scope.get("df")
+    if not isinstance(result_df, pd.DataFrame):
+        raise ValueError("수정 코드 실행 결과가 DataFrame이 아닙니다.")
+
+    return _clean_dataframe(result_df)
+
+
+def _fallback_edit_code(command: str, df: pd.DataFrame) -> str:
+    q = (command or "").strip()
+    if not q:
+        raise ValueError("수정 명령이 비어 있습니다.")
+
+    numeric_filter = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?P<op>이하|미만|이상|초과|<=|>=|<|>)\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?:인)?\s*(?:행|데이터|사람)?\s*(?P<action>제외|삭제|빼고|빼줘|제거|남겨|필터|유지)",
+        q,
+    )
+    if numeric_filter:
+        col_hint = _strip_particle(numeric_filter.group("col"))
+        resolved_col = _resolve_column_name(col_hint, list(df.columns))
+        if not resolved_col:
+            raise ValueError(f"컬럼을 찾을 수 없습니다: {col_hint}")
+        op = _normalize_comp_op(numeric_filter.group("op"))
+        action = numeric_filter.group("action")
+        exclude_mode = action in ["제외", "삭제", "빼고", "빼줘", "제거"]
+        return _build_numeric_filter_code(resolved_col, op, numeric_filter.group("value"), exclude_mode)
+
+    keep_category = re.search(
+        r"(?P<token>[가-힣A-Za-z0-9_\s]+?)\s*(?:데이터)?\s*만\s*(?:남겨|유지|필터)",
+        q,
+    )
+    if keep_category:
+        guessed = _guess_category_filter_code(keep_category.group("token"), df)
+        if guessed:
+            return guessed
+
+    set_all = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:값|수치)?\s*(?:을|를)?\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?:으로|로)\s*(?:바꿔|변경|수정)",
+        q,
+    )
+    if set_all:
+        col_hint = _strip_particle(set_all.group("col"))
+        resolved_col = _resolve_column_name(col_hint, list(df.columns))
+        if not resolved_col:
+            raise ValueError(f"컬럼을 찾을 수 없습니다: {col_hint}")
+        return f"df = df.assign(**{{'{resolved_col}': {set_all.group('value')}}})"
+
+    fill_na = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:결측치|빈값|누락값)\s*(?:을|를)?\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?:으로|로)\s*(?:채워|대체|변경)",
+        q,
+    )
+    if fill_na:
+        col_hint = _strip_particle(fill_na.group("col"))
+        resolved_col = _resolve_column_name(col_hint, list(df.columns))
+        if not resolved_col:
+            raise ValueError(f"컬럼을 찾을 수 없습니다: {col_hint}")
+        val = fill_na.group("value")
+        return (
+            "df = df.assign(**{" +
+            f"'{resolved_col}': pd.to_numeric(df['{resolved_col}'], errors='coerce').fillna({val})" +
+            "})"
+        )
+
+    raise ValueError(
+        "명령을 자동 해석하지 못했습니다. 예: '소득이 3000 이하인 행 제외', '여성 데이터만 남겨', '나이 결측치를 0으로 채워'."
+    )
+
+
+def _generate_edit_code(command: str, df: pd.DataFrame) -> str:
+    use_llm = os.environ.get("DATALENS_USE_LLM_EDIT", os.environ.get("DATALENS_USE_LLM", "0")) == "1"
+
+    if use_llm:
+        try:
+            schema = [
+                {
+                    "name": str(col),
+                    "dtype": str(df[col].dtype),
+                    "samples": [_to_jsonable_value(v) for v in df[col].dropna().head(3).tolist()],
+                }
+                for col in df.columns
+            ]
+            llm_response = ollama.chat(
+                model="llama3.2",
+                messages=[
+                    {"role": "system", "content": EDIT_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "user_command": command,
+                                "columns": schema,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+            )
+            candidate = _extract_python_line(llm_response["message"]["content"])
+            return _validate_edit_code(candidate)
+        except Exception:
+            pass
+
+    return _fallback_edit_code(command, df)
 
 
 def _is_id_like_column(col_name: str, series: pd.Series) -> bool:
@@ -1132,6 +1672,93 @@ def _call_llama(question: str, summary: dict[str, Any], evidence: dict[str, Any]
     return parsed
 
 
+def _generate_analysis_payload(df: pd.DataFrame, file_name: str, question: str) -> dict[str, Any]:
+    masked = _mask_dataframe(df)
+    summary = _build_summary(masked)
+    evidence = _compute_stat_evidence(masked)
+
+    # 그룹형 비교가 가능한 경우, 차트를 "열 평균"이 아닌 "그룹 평균" 기준으로 교체
+    grouped_chart = _build_group_metric_chart_data(masked, evidence)
+    if grouped_chart:
+        summary["chart_data"] = grouped_chart["chart_data"]
+        evidence["group_metric"] = {
+            "group_col": grouped_chart["group_col"],
+            "value_col": grouped_chart["value_col"],
+            "n_groups": grouped_chart["n_groups"],
+        }
+
+    use_llm = os.environ.get("DATALENS_USE_LLM", "0") == "1"
+
+    if use_llm:
+        try:
+            llm = _call_llama(question, summary, evidence)
+        except Exception:
+            llm = _build_fallback_response(summary, evidence, question)
+    else:
+        llm = _build_fallback_response(summary, evidence, question)
+
+    recommended_method = _normalize_method_name(llm.get("recommended_method", "기술통계"))
+
+    # 질문/데이터에 맞는 기법별 시각화 번들 생성
+    viz_bundle = _build_method_visualization(
+        masked,
+        evidence,
+        recommended_method,
+        summary.get("chart_data", []),
+    )
+
+    method_options = _build_method_options(evidence)
+    evidence["method_scores"] = _compute_method_scores(evidence)
+    evidence["visualization"] = viz_bundle.get("chart_meta", {})
+    evidence["secondary_chart_data"] = viz_bundle.get("secondary_chart_data", [])
+
+    next_question = llm.get("next_question")
+    if not isinstance(next_question, str) or not next_question.strip():
+        next_question = "추가로 상관분석, 회귀분석, ANOVA, 교차분석 중 어떤 분석을 먼저 실행할까요?"
+
+    payload = {
+        "status": "success",
+        "recommended_method": recommended_method,
+        "explanation": llm.get("explanation", "분석 설명을 생성하지 못했습니다."),
+        "insights": llm.get("insights", []),
+        "chart_data": viz_bundle.get("chart_data", summary.get("chart_data", [])),
+        "secondary_chart_data": viz_bundle.get("secondary_chart_data", []),
+        "chart_meta": viz_bundle.get("chart_meta", {}),
+        "method_options": method_options,
+        "next_question": next_question,
+        "table_data": summary.get("columns", []),
+        "summary": {
+            "row_count": summary.get("row_count", 0),
+            "column_count": summary.get("column_count", 0),
+            "missing_total": summary.get("missing_total", 0),
+        },
+        "evidence": evidence,
+    }
+
+    db = SessionLocal()
+    try:
+        model = AnalysisReportModel(
+            file_name=file_name,
+            question=question,
+            recommended_method=payload["recommended_method"],
+            explanation=payload["explanation"],
+            insights_json=json.dumps(payload["insights"], ensure_ascii=False),
+            chart_data_json=json.dumps(payload["chart_data"], ensure_ascii=False),
+            table_data_json=json.dumps(payload["table_data"], ensure_ascii=False),
+            summary_json=json.dumps(payload["summary"], ensure_ascii=False),
+            evidence_json=json.dumps(payload["evidence"], ensure_ascii=False),
+        )
+        db.add(model)
+        db.commit()
+        db.refresh(model)
+        payload["report_id"] = model.id
+        payload["created_at"] = model.created_at.isoformat()
+    finally:
+        db.close()
+
+    return payload
+
+
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {"status": "ok"}
@@ -1200,6 +1827,26 @@ def get_report(report_id: int) -> dict[str, Any]:
         if not row:
             raise HTTPException(status_code=404, detail="리포트를 찾을 수 없습니다.")
         return _serialize_report(row)
+    finally:
+        db.close()
+
+
+@app.get("/reports/{report_id}/export/pdf")
+def export_report_pdf(report_id: int):
+    db = SessionLocal()
+    try:
+        row = db.query(AnalysisReportModel).filter(AnalysisReportModel.id == report_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="리포트를 찾을 수 없습니다.")
+
+        report = _serialize_report(row)
+        pdf_bytes = _build_report_pdf_bytes(report)
+
+        stem = _safe_filename(os.path.splitext(str(row.file_name))[0], default_stem=f"report_{report_id}")
+        filename = f"{stem}_report_{report_id}.pdf"
+        headers = {"Content-Disposition": _content_disposition(filename)}
+
+        return StreamingResponse(BytesIO(pdf_bytes), media_type="application/pdf", headers=headers)
     finally:
         db.close()
 
@@ -1298,87 +1945,72 @@ def analyze(
 ) -> dict[str, Any]:
     file_name = file.filename or "uploaded_file"
     df = _read_upload(file)
-    masked = _mask_dataframe(df)
-    summary = _build_summary(masked)
-    evidence = _compute_stat_evidence(masked)
-
-    # 그룹형 비교가 가능한 경우, 차트를 "열 평균"이 아닌 "그룹 평균" 기준으로 교체
-    grouped_chart = _build_group_metric_chart_data(masked, evidence)
-    if grouped_chart:
-        summary["chart_data"] = grouped_chart["chart_data"]
-        evidence["group_metric"] = {
-            "group_col": grouped_chart["group_col"],
-            "value_col": grouped_chart["value_col"],
-            "n_groups": grouped_chart["n_groups"],
-        }
-
-    use_llm = os.environ.get("DATALENS_USE_LLM", "0") == "1"
-
-    if use_llm:
-        try:
-            llm = _call_llama(question, summary, evidence)
-        except Exception:
-            llm = _build_fallback_response(summary, evidence, question)
-    else:
-        llm = _build_fallback_response(summary, evidence, question)
-
-    recommended_method = _normalize_method_name(llm.get("recommended_method", "기술통계"))
-
-    # 질문/데이터에 맞는 기법별 시각화 번들 생성
-    viz_bundle = _build_method_visualization(
-        masked,
-        evidence,
-        recommended_method,
-        summary.get("chart_data", []),
-    )
-
-    method_options = _build_method_options(evidence)
-    evidence["method_scores"] = _compute_method_scores(evidence)
-    evidence["visualization"] = viz_bundle.get("chart_meta", {})
-    evidence["secondary_chart_data"] = viz_bundle.get("secondary_chart_data", [])
-
-    next_question = llm.get("next_question")
-    if not isinstance(next_question, str) or not next_question.strip():
-        next_question = "추가로 상관분석, 회귀분석, ANOVA, 교차분석 중 어떤 분석을 먼저 실행할까요?"
-
-    payload = {
-        "status": "success",
-        "recommended_method": recommended_method,
-        "explanation": llm.get("explanation", "분석 설명을 생성하지 못했습니다."),
-        "insights": llm.get("insights", []),
-        "chart_data": viz_bundle.get("chart_data", summary.get("chart_data", [])),
-        "secondary_chart_data": viz_bundle.get("secondary_chart_data", []),
-        "chart_meta": viz_bundle.get("chart_meta", {}),
-        "method_options": method_options,
-        "next_question": next_question,
-        "table_data": summary.get("columns", []),
-        "summary": {
-            "row_count": summary.get("row_count", 0),
-            "column_count": summary.get("column_count", 0),
-            "missing_total": summary.get("missing_total", 0),
-        },
-        "evidence": evidence,
-    }
-
-    db = SessionLocal()
-    try:
-        model = AnalysisReportModel(
-            file_name=file_name,
-            question=question,
-            recommended_method=payload["recommended_method"],
-            explanation=payload["explanation"],
-            insights_json=json.dumps(payload["insights"], ensure_ascii=False),
-            chart_data_json=json.dumps(payload["chart_data"], ensure_ascii=False),
-            table_data_json=json.dumps(payload["table_data"], ensure_ascii=False),
-            summary_json=json.dumps(payload["summary"], ensure_ascii=False),
-            evidence_json=json.dumps(payload["evidence"], ensure_ascii=False),
-        )
-        db.add(model)
-        db.commit()
-        db.refresh(model)
-        payload["report_id"] = model.id
-        payload["created_at"] = model.created_at.isoformat()
-    finally:
-        db.close()
+    session_id = _create_dataframe_session(file_name, df)
+    payload = _generate_analysis_payload(df, file_name, question)
+    payload["session_id"] = session_id
+    payload["is_modified"] = False
+    payload.update(_build_grid_payload(df))
 
     return payload
+
+
+@app.post("/session/analyze")
+def analyze_session(payload: SessionAnalyzeRequest) -> dict[str, Any]:
+    entry = _get_dataframe_session(payload.session_id)
+    file_name = str(entry.get("file_name") or "uploaded_file")
+    df = entry["df"]
+    analysis_payload = _generate_analysis_payload(df, file_name, payload.question)
+    analysis_payload["session_id"] = payload.session_id
+    analysis_payload["is_modified"] = bool(entry.get("is_modified", False))
+    analysis_payload.update(_build_grid_payload(df))
+    return analysis_payload
+
+
+@app.post("/session/edit")
+def edit_session(payload: SessionEditRequest) -> dict[str, Any]:
+    command = (payload.command or "").strip()
+    if not command:
+        raise HTTPException(status_code=400, detail="수정 명령은 비워둘 수 없습니다.")
+
+    entry = _get_dataframe_session(payload.session_id)
+    current_df = entry["df"]
+
+    try:
+        code = _generate_edit_code(command, current_df)
+        updated_df = _execute_edit_code(current_df, code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"데이터 수정 실패: {exc}") from exc
+
+    entry["df"] = updated_df
+    entry["is_modified"] = True
+    entry["updated_at"] = _utcnow()
+
+    file_name = str(entry.get("file_name") or "uploaded_file")
+    analysis_question = (payload.question or "").strip()
+    if not analysis_question:
+        analysis_question = f"사용자 명령 '{command}' 적용 후 데이터 변화를 요약해줘"
+
+    analysis_payload = _generate_analysis_payload(updated_df, file_name, analysis_question)
+    analysis_payload["session_id"] = payload.session_id
+    analysis_payload["is_modified"] = True
+    analysis_payload["applied_code"] = code
+    analysis_payload["applied_command"] = command
+    analysis_payload.update(_build_grid_payload(updated_df))
+    return analysis_payload
+
+
+@app.get("/session/{session_id}/export/excel")
+def export_session_excel(session_id: str):
+    entry = _get_dataframe_session(session_id)
+    df = entry["df"]
+    excel_bytes = _build_excel_bytes(df)
+
+    original_name = str(entry.get("file_name") or "edited_data")
+    stem = _safe_filename(os.path.splitext(original_name)[0], default_stem="edited_data")
+    filename = f"{stem}_edited.xlsx"
+    headers = {"Content-Disposition": _content_disposition(filename)}
+
+    media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return StreamingResponse(BytesIO(excel_bytes), media_type=media_type, headers=headers)

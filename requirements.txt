@@ -7,3 +7,4 @@ python-multipart
 scipy
 sqlalchemy
 psycopg2-binary
+reportlab
