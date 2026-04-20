@@ -597,6 +597,11 @@ def _cleanup_column_hint(col_hint: str) -> str:
     return cleaned
 
 
+def _py_single_quoted(value: str) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
 def _resolve_column_name(col_hint: str, columns: list[Any]) -> str | None:
     if not col_hint:
         return None
@@ -723,12 +728,175 @@ def _build_round_code(command: str, df: pd.DataFrame) -> str | None:
     if not resolved_col and "점수" in q:
         resolved_col = _resolve_column_name("점수", list(df.columns))
 
+    if resolved_col:
+        return (
+            "df = df.assign(**{" +
+            f"'{resolved_col}': pd.to_numeric(df['{resolved_col}'], errors='coerce').round({places})" +
+            "})"
+        )
+
+    # 컬럼명이 명시되지 않으면 수치형 컬럼 전체 반올림을 지원한다.
+    numeric_cols: list[str] = []
+    for c in df.columns:
+        ser = df[c]
+        num = pd.to_numeric(ser, errors="coerce")
+        non_null = num.dropna()
+        if len(non_null) == 0:
+            continue
+        if _is_id_like_column(str(c), ser):
+            continue
+        lower_name = str(c).lower()
+        if int(non_null.nunique()) <= 2 and re.search(r"여부|flag|bool|is_", lower_name):
+            continue
+        numeric_cols.append(str(c))
+
+    if not numeric_cols:
+        numeric_cols = [str(c) for c in df.columns if int(pd.to_numeric(df[c], errors="coerce").notna().sum()) > 0]
+
+    if not numeric_cols:
+        return None
+
+    assign_parts = [
+        f"'{col}': pd.to_numeric(df['{col}'], errors='coerce').round({places})"
+        for col in numeric_cols
+    ]
+    return "df = df.assign(**{" + ", ".join(assign_parts) + "})"
+
+
+def _extract_random_category_labels(command: str) -> list[str]:
+    q = (command or "").strip()
+    if not q:
+        return []
+
+    q_norm = q.replace("，", ",")
+    labels_part = ""
+
+    match = re.search(
+        r"(?P<labels>[A-Za-z가-힣0-9_\s,|/]+?)\s*(?:임의|임이|랜덤|무작위)?\s*(?:의\s*)?(?:그룹|카테고리|값)\s*(?:으로|로)",
+        q_norm,
+    )
+    if match:
+        labels_part = match.group("labels")
+
+    if not labels_part:
+        quote_tokens = re.findall(r"'([^']+)'|\"([^\"]+)\"", q_norm)
+        merged = [a or b for a, b in quote_tokens if (a or b)]
+        if len(merged) >= 2:
+            return list(dict.fromkeys(merged))
+
+    stopwords = {
+        "비어있는",
+        "비어",
+        "있는",
+        "빈",
+        "결측",
+        "누락",
+        "그룹",
+        "카테고리",
+        "값",
+        "부분",
+        "행",
+        "데이터",
+        "임의",
+        "임이",
+        "랜덤",
+        "무작위",
+        "채워",
+        "채워줘",
+        "넣어",
+        "넣어줘",
+        "입력",
+        "해줘",
+        "사이",
+        "부터",
+        "까지",
+        "으로",
+        "로",
+    }
+
+    labels: list[str] = []
+    if labels_part:
+        if re.search(r"[,|/]", labels_part):
+            raw_parts = re.split(r"\s*[,|/]\s*", labels_part)
+        else:
+            raw_parts = re.split(r"\s+", labels_part)
+        for part in raw_parts:
+            tok = part.strip()
+            tok = re.sub(r"(?:비어\s*있는|비어있는|비어\s*있|결측|누락|빈값|빈)\s*", "", tok)
+            tok = re.sub(r"(?:그룹|카테고리|값)(?:을|를|이|가|에)?", " ", tok)
+            tok = re.sub(r"\s+", " ", tok).strip()
+            if " " in tok:
+                tok = [t for t in tok.split(" ") if t and t not in stopwords][-1] if [t for t in tok.split(" ") if t and t not in stopwords] else ""
+            if not tok or tok in stopwords:
+                continue
+            if re.fullmatch(r"\d+(?:\.\d+)?", tok):
+                continue
+            labels.append(tok)
+
+    if len(labels) < 2:
+        alpha_labels = re.findall(r"\b([A-Z])\b", q_norm)
+        if len(alpha_labels) >= 2:
+            labels = alpha_labels
+
+    # 첫 토큰에 문맥 문장이 섞인 경우(A,B,C,D 패턴 우선)
+    if len(labels) >= 2 and re.search(r"[가-힣]", labels[0]):
+        alpha_labels = re.findall(r"\b([A-Z])\b", q_norm)
+        if len(alpha_labels) >= 2:
+            labels = alpha_labels
+
+    return list(dict.fromkeys(labels))
+
+
+def _build_random_categorical_fill_code(command: str, df: pd.DataFrame) -> str | None:
+    q = (command or "").strip()
+    if not q:
+        return None
+
+    random_intent = bool(re.search(r"무작위|랜덤|random|임의|임이", q, flags=re.IGNORECASE))
+    fill_intent = bool(re.search(r"채워|넣어|집어|대체|입력|보정", q))
+    missing_intent = bool(re.search(r"없는|결측|빈값|누락|비어\s*있는|비어있는|비어\s*있", q))
+
+    if not random_intent or not (fill_intent or missing_intent):
+        return None
+
+    labels = _extract_random_category_labels(q)
+    if len(labels) < 2:
+        return None
+
+    col_hint_match = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:가|이|의|부분(?:에)?)?\s*(?:없는|결측|빈값|누락|비어\s*있는|비어있는|비어\s*있)",
+        q,
+    )
+    col_hint = _cleanup_column_hint(col_hint_match.group("col")) if col_hint_match else ""
+
+    if "그룹" in q and not col_hint:
+        col_hint = "그룹"
+
+    resolved_col = _resolve_column_name(col_hint, list(df.columns)) if col_hint else None
+    if not resolved_col:
+        obj_na_candidates: list[str] = []
+        for c in df.columns:
+            ser = df[c]
+            if int(ser.isna().sum()) <= 0:
+                continue
+            if pd.api.types.is_numeric_dtype(ser):
+                continue
+            obj_na_candidates.append(str(c))
+        if obj_na_candidates:
+            group_like = [c for c in obj_na_candidates if "그룹" in c]
+            resolved_col = group_like[0] if group_like else obj_na_candidates[0]
+
+    if not resolved_col and "그룹" in q:
+        label_list_literal = ", ".join([_py_single_quoted(v) for v in labels])
+        return "df = df.assign(**{" + f"'그룹': np.random.choice([{label_list_literal}], size=df.shape[0])" + "})"
+
     if not resolved_col:
         return None
 
+    label_list_literal = ", ".join([_py_single_quoted(v) for v in labels])
     return (
         "df = df.assign(**{" +
-        f"'{resolved_col}': pd.to_numeric(df['{resolved_col}'], errors='coerce').round({places})" +
+        f"'{resolved_col}': df['{resolved_col}'].astype('string').where(df['{resolved_col}'].astype('string').notna(), np.random.choice([{label_list_literal}], size=df.shape[0]))" +
         "})"
     )
 
@@ -772,15 +940,18 @@ def _build_random_fillna_code(command: str, df: pd.DataFrame) -> str | None:
     if not q:
         return None
 
-    random_intent = bool(re.search(r"무작위|랜덤|random", q, flags=re.IGNORECASE))
+    random_intent = bool(re.search(r"무작위|랜덤|random|임의|임이", q, flags=re.IGNORECASE))
     fill_intent = bool(re.search(r"채워|넣어|집어|대체|입력|보정", q))
-    missing_intent = bool(re.search(r"없는|결측|빈값|누락", q))
+    missing_intent = bool(re.search(r"없는|결측|빈값|누락|비어\s*있는|비어있는|비어\s*있", q))
 
     if not random_intent or not (fill_intent or missing_intent):
         return None
 
-    col_hint_match = re.search(r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:가|이|의)?\s*(?:없는|결측|빈값|누락)", q)
-    col_hint = _strip_particle(col_hint_match.group("col")) if col_hint_match else ""
+    col_hint_match = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:가|이|의|부분(?:에)?)?\s*(?:없는|결측|빈값|누락|비어\s*있는|비어있는|비어\s*있)",
+        q,
+    )
+    col_hint = _cleanup_column_hint(col_hint_match.group("col")) if col_hint_match else ""
 
     if "나이" in q and not col_hint:
         col_hint = "나이"
@@ -822,18 +993,41 @@ def _build_random_fillna_code(command: str, df: pd.DataFrame) -> str | None:
     if not resolved_col:
         return None
 
+    range_match = re.search(
+        r"(?P<min>-?\d+(?:\.\d+)?)\s*(?:~|〜|\-)\s*(?P<max>-?\d+(?:\.\d+)?)",
+        q,
+    )
+    if not range_match:
+        range_match = re.search(
+            r"(?P<min>-?\d+(?:\.\d+)?)\s*부터\s*(?P<max>-?\d+(?:\.\d+)?)\s*(?:까지|사이)",
+            q,
+        )
+
     max_match = re.search(r"(?:최대|맥스|max)\s*(?P<max>\d+(?:\.\d+)?)", q, flags=re.IGNORECASE)
     if not max_match:
         max_match = re.search(r"(?P<max>\d+(?:\.\d+)?)\s*세\s*까지", q)
     min_match = re.search(r"(?:최소|min)\s*(?P<min>\d+(?:\.\d+)?)", q, flags=re.IGNORECASE)
 
-    max_val = float(max_match.group("max")) if max_match else 60.0
-    min_val = float(min_match.group("min")) if min_match else (1.0 if "나이" in resolved_col else 0.0)
+    if range_match:
+        min_val = float(range_match.group("min"))
+        max_val = float(range_match.group("max"))
+    else:
+        max_val = float(max_match.group("max")) if max_match else 60.0
+        min_val = float(min_match.group("min")) if min_match else (1.0 if "나이" in resolved_col else 0.0)
 
     if max_val <= min_val:
         max_val = min_val + 1.0
 
     numeric_series = pd.to_numeric(df[resolved_col], errors="coerce")
+    is_numeric_target = bool(
+        pd.api.types.is_numeric_dtype(df[resolved_col])
+        or int(numeric_series.notna().sum()) > 0
+        or "나이" in resolved_col
+        or "나이" in q
+    )
+    if not is_numeric_target:
+        return None
+
     non_null = numeric_series.dropna()
     integer_like = bool("나이" in resolved_col)
     if len(non_null) > 0 and not integer_like:
@@ -853,6 +1047,52 @@ def _build_random_fillna_code(command: str, df: pd.DataFrame) -> str | None:
         f"'{resolved_col}': pd.to_numeric(df['{resolved_col}'], errors='coerce').where(pd.to_numeric(df['{resolved_col}'], errors='coerce').notna(), {random_expr})" +
         "})"
     )
+
+
+def _build_direct_put_code(command: str, df: pd.DataFrame) -> str | None:
+    q = (command or "").strip()
+    if not q:
+        return None
+
+    put_match = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:에|값(?:을|를)?)\s*(?P<value>'[^']+'|\"[^\"]+\"|-?\d+(?:\.\d+)?|[A-Za-z가-힣][A-Za-z가-힣0-9_]*)\s*(?:을|를)?\s*(?:넣어줘|넣어|입력해줘|입력|대입해줘|대입|채워줘|채워)",
+        q,
+    )
+    if not put_match:
+        return None
+
+    col_hint = _cleanup_column_hint(put_match.group("col"))
+    resolved_col = _resolve_column_name(col_hint, list(df.columns))
+    if not resolved_col:
+        return None
+
+    raw_value = put_match.group("value").strip()
+    if (raw_value.startswith("'") and raw_value.endswith("'")) or (raw_value.startswith('"') and raw_value.endswith('"')):
+        value_literal = _py_single_quoted(raw_value[1:-1])
+        is_numeric_value = False
+    elif re.fullmatch(r"-?\d+(?:\.\d+)?", raw_value):
+        value_literal = raw_value
+        is_numeric_value = True
+    else:
+        value_literal = _py_single_quoted(raw_value)
+        is_numeric_value = False
+
+    missing_intent = bool(re.search(r"없는|결측|빈값|누락|비어\s*있는|비어있는|비어\s*있", q))
+
+    if missing_intent:
+        if is_numeric_value:
+            return (
+                "df = df.assign(**{" +
+                f"'{resolved_col}': pd.to_numeric(df['{resolved_col}'], errors='coerce').where(pd.to_numeric(df['{resolved_col}'], errors='coerce').notna(), {value_literal})" +
+                "})"
+            )
+        return (
+            "df = df.assign(**{" +
+            f"'{resolved_col}': df['{resolved_col}'].astype('string').where(df['{resolved_col}'].astype('string').notna(), {value_literal})" +
+            "})"
+        )
+
+    return "df = df.assign(**{" + f"'{resolved_col}': {value_literal}" + "})"
 
 
 def _guess_category_filter_code(token: str, df: pd.DataFrame) -> str | None:
@@ -997,9 +1237,17 @@ def _fallback_edit_code(command: str, df: pd.DataFrame) -> str:
     if arithmetic_code:
         return arithmetic_code
 
+    random_categorical_fill = _build_random_categorical_fill_code(q, df)
+    if random_categorical_fill:
+        return random_categorical_fill
+
     random_fill = _build_random_fillna_code(q, df)
     if random_fill:
         return random_fill
+
+    direct_put = _build_direct_put_code(q, df)
+    if direct_put:
+        return direct_put
 
     numeric_filter = re.search(
         r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?P<op>이하|미만|이상|초과|<=|>=|<|>)\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?:인)?\s*(?:행|데이터|사람)?\s*(?P<action>제외|삭제|빼고|빼줘|제거|남겨|필터|유지)",
@@ -1058,6 +1306,12 @@ def _fallback_edit_code(command: str, df: pd.DataFrame) -> str:
 
 def _generate_edit_code(command: str, df: pd.DataFrame) -> str:
     use_llm = os.environ.get("DATALENS_USE_LLM_EDIT", os.environ.get("DATALENS_USE_LLM", "0")) == "1"
+
+    # 규칙 기반 해석을 우선 적용해 사용자 명령 반영 정확도를 높인다.
+    try:
+        return _fallback_edit_code(command, df)
+    except Exception:
+        pass
 
     if use_llm:
         try:
