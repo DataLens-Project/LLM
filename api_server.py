@@ -125,10 +125,12 @@ SYSTEM_PROMPT = """
 
 규칙:
 1) 반드시 한국어만 사용
-2) 제공된 통계 요약 외 임의 수치 생성 금지
+2) 제공된 통계 요약·통계 근거 JSON에 있는 숫자만 인용하고, 없는 수치·추측은 쓰지 마라
 3) p-value가 0.05보다 작으면 유의미하다고 설명
 4) 개인정보(이름, 전화번호, 이메일, 주소)는 절대 출력 금지
 5) 설명은 보고서 톤으로 자연스럽고 문법적으로 정확하게 작성
+6) 상관계수 r과 '영향도·회귀계수'를 혼동하지 마라. 회귀 근거에 standardized_betas·r_squared가 있으면 그것을 우선 설명하라
+7) chart_data는 [데이터 요약]의 chart_data를 그대로 쓰거나, 의미가 같도록만 조정하라
 """.strip()
 
 EDIT_SYSTEM_PROMPT = """
@@ -1690,6 +1692,51 @@ def _build_summary(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _standardized_ols_metrics(df: pd.DataFrame, target: str, features: list[str]) -> dict[str, Any] | None:
+    """표준화된 설명변수로 최소제곱 추정. 반환: standardized_betas, r_squared, simple_pearson_r, n."""
+    feats = [f for f in features if f in df.columns and f != target][:10]
+    if len(feats) < 2:
+        return None
+    cols = [target] + feats
+    work = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(work) < max(35, len(feats) * 8):
+        return None
+
+    X = work[feats].to_numpy(dtype=float)
+    y = work[target].to_numpy(dtype=float)
+    x_std = X.std(axis=0, ddof=1)
+    y_std = float(y.std(ddof=1))
+    if np.any(x_std <= 1e-12) or y_std <= 1e-12:
+        return None
+
+    Xz = (X - X.mean(axis=0)) / x_std
+    yz = (y - float(y.mean())) / y_std
+
+    try:
+        beta, _, _, _ = np.linalg.lstsq(Xz, yz, rcond=None)
+    except Exception:
+        beta = np.linalg.pinv(Xz) @ yz
+
+    y_hat = Xz @ beta
+    yz_c = yz - float(np.mean(yz))
+    ss_res = float(np.sum((yz - y_hat) ** 2))
+    ss_tot = float(np.sum(yz_c**2))
+    r2 = max(0.0, min(1.0, 1.0 - ss_res / ss_tot)) if ss_tot > 1e-12 else 0.0
+
+    simple_r: dict[str, float] = {}
+    for name in feats:
+        rp, _ = stats.pearsonr(work[target], work[name])
+        simple_r[str(name)] = round(float(rp), 4)
+
+    betas_out = {str(name): round(float(beta[j]), 4) for j, name in enumerate(feats)}
+    return {
+        "standardized_betas": betas_out,
+        "r_squared": round(float(r2), 4),
+        "n_samples": int(len(work)),
+        "simple_pearson_r": simple_r,
+    }
+
+
 def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "t_test": None,
@@ -1829,13 +1876,17 @@ def _compute_stat_evidence(df: pd.DataFrame) -> dict[str, Any]:
             r, _ = stats.pearsonr(sub[target], sub[c])
             corr_scores.append((abs(float(r)), c))
         corr_scores.sort(reverse=True)
-        features = [c for _, c in corr_scores[:3]]
+        features = [c for _, c in corr_scores[:5]]
         if len(features) >= 2:
-            evidence["regression"] = {
+            reg: dict[str, Any] = {
                 "target": str(target),
-                "features": [str(f) for f in features],
-                "note": "다중회귀 후보",
+                "features": [str(f) for f in features[:3]],
+                "note": "표준화 OLS 다중회귀 근사",
             }
+            ols = _standardized_ols_metrics(df, str(target), [str(f) for f in features[:3]])
+            if ols:
+                reg.update(ols)
+            evidence["regression"] = reg
 
     # 5) 카이제곱: 범주형-범주형 조합
     best_chi = None
@@ -1896,12 +1947,15 @@ def _compute_method_scores(evidence: dict[str, Any]) -> dict[str, dict[str, Any]
 
     reg = evidence.get("regression")
     if reg:
-        n_feat = len(reg.get("features", []))
-        base = min(100.0, 45 + n_feat * 15)
-        scores["회귀분석"] = {
-            "score": round(base, 1),
-            "reason": f"target={reg.get('target')}, features={', '.join(reg.get('features', []))}",
-        }
+        r2 = reg.get("r_squared")
+        if isinstance(r2, (int, float)):
+            base = min(100.0, 25 + float(r2) * 100)
+            reason = f"R²={r2}, target={reg.get('target')}"
+        else:
+            n_feat = len(reg.get("features", []))
+            base = min(100.0, 35 + n_feat * 12)
+            reason = f"target={reg.get('target')}, features={', '.join(reg.get('features', []))}"
+        scores["회귀분석"] = {"score": round(base, 1), "reason": reason}
     else:
         scores["회귀분석"] = {"score": 0.0, "reason": "타깃/설명변수 후보 부족"}
 
@@ -1951,17 +2005,29 @@ def _build_method_visualization(
     method_norm = _normalize_method_name(method)
 
     def _with_fallback(meta_title: str, meta_desc: str) -> dict[str, Any]:
+        secondary: list[dict[str, Any]] = []
+        for r in default_chart_data:
+            if isinstance(r, dict) and "raw_mean" in r and r.get("raw_mean") is not None:
+                rm = float(r["raw_mean"])
+                secondary.append(
+                    {"category": str(r.get("category", "")), "value": round(rm, 4), "raw_mean": round(rm, 4)}
+                )
         return {
             "chart_data": default_chart_data,
-            "secondary_chart_data": [],
+            "secondary_chart_data": secondary,
             "chart_meta": {
                 "mode": "numeric_profile",
                 "primary_chart": "bar",
                 "secondary_chart": "line",
                 "title": meta_title,
-                "secondary_title": "추세 분석",
-                "description": meta_desc,
+                "secondary_title": "변수별 실제 평균(원단위)",
+                "description": (
+                    meta_desc
+                    + " 위 막대의 세로 길이는 열 간 비교를 위해 스케일을 맞춘 값이며, "
+                    "보조 추세선은 raw_mean(실제 평균)입니다."
+                ),
                 "value_key": "value",
+                "secondary_value_key": "value",
             },
         }
 
@@ -2024,27 +2090,34 @@ def _build_method_visualization(
                 try:
                     sub = sub.copy()
                     sub["_bin"] = pd.qcut(sub[x_col], q=n_bins, duplicates="drop")
-                    grouped = sub.groupby("_bin", observed=True)[y_col].mean().reset_index()
-                    grouped = grouped.rename(columns={y_col: "raw_mean"})
-                    rows = []
-                    for _, row in grouped.iterrows():
+                    gmean = sub.groupby("_bin", observed=True)[y_col].mean().reset_index().rename(columns={y_col: "raw_mean"})
+                    gcnt = sub.groupby("_bin", observed=True).size().reset_index(name="n")
+                    merged = gmean.merge(gcnt, on="_bin")
+                    rows: list[dict[str, Any]] = []
+                    secondary_rows: list[dict[str, Any]] = []
+                    for _, row in merged.iterrows():
+                        cat_full = str(row["_bin"])
+                        cat = cat_full[:45] + "…" if len(cat_full) > 48 else cat_full
                         raw = float(row["raw_mean"])
-                        cat = str(row["_bin"])
-                        if len(cat) > 48:
-                            cat = cat[:45] + "…"
+                        n = int(row["n"])
                         rows.append({"category": cat, "value": round(raw, 4), "raw_mean": round(raw, 4)})
+                        secondary_rows.append({"category": cat, "value": float(n), "raw_mean": float(n)})
                     return {
                         "chart_data": rows,
-                        "secondary_chart_data": [dict(r) for r in rows],
+                        "secondary_chart_data": secondary_rows,
                         "chart_meta": {
                             "mode": "correlation_curve",
                             "primary_chart": "line",
                             "secondary_chart": "bar",
-                            "title": f"{x_col} 구간별 {y_col} 평균 추세",
-                            "secondary_title": "구간별 평균 막대",
-                            "description": f"상관 강도(r={corr.get('r')})가 큰 변수쌍에 대해 {x_col} 분위 구간별 {y_col} 평균을 보여 줍니다.",
+                            "title": f"{x_col} 분위 구간별 {y_col} 평균",
+                            "secondary_title": f"{x_col} 분위별 구간 표본 수",
+                            "description": (
+                                f"전체 Pearson r={corr.get('r')}, p={corr.get('p_value')}입니다. "
+                                f"주 차트는 {x_col}을 분위로 나눈 뒤 각 구간에서의 {y_col} 평균(비선형·이질성 참고용)이고, "
+                                "보조 막대는 각 구간에 포함된 행 수입니다."
+                            ),
                             "value_key": "raw_mean",
-                            "secondary_value_key": "raw_mean",
+                            "secondary_value_key": "value",
                         },
                     }
                 except Exception:
@@ -2054,6 +2127,58 @@ def _build_method_visualization(
         reg = evidence.get("regression")
         target = reg.get("target")
         features = reg.get("features", [])
+        betas = reg.get("standardized_betas") if isinstance(reg.get("standardized_betas"), dict) else {}
+        simple_r = reg.get("simple_pearson_r") if isinstance(reg.get("simple_pearson_r"), dict) else {}
+        r2 = reg.get("r_squared")
+
+        if target in df.columns and isinstance(features, list) and features and betas:
+            rows: list[dict[str, Any]] = []
+            for fname, b in sorted(betas.items(), key=lambda x: abs(float(x[1])), reverse=True):
+                beta = float(b)
+                rows.append(
+                    {
+                        "category": str(fname),
+                        "value": round(min(100.0, abs(beta) * 100), 2),
+                        "raw_mean": round(beta, 4),
+                    }
+                )
+            order = [r["category"] for r in rows]
+            secondary_rows: list[dict[str, Any]] = []
+            for cat in order:
+                rp = simple_r.get(cat)
+                if rp is None and cat in df.columns and target in df.columns:
+                    sub1 = df[[target, cat]].apply(pd.to_numeric, errors="coerce").dropna()
+                    if len(sub1) >= 15:
+                        rp, _ = stats.pearsonr(sub1[target], sub1[cat])
+                        rp = float(rp)
+                if rp is not None:
+                    secondary_rows.append(
+                        {
+                            "category": cat,
+                            "value": round(min(100.0, abs(float(rp)) * 100), 2),
+                            "raw_mean": round(float(rp), 4),
+                        }
+                    )
+            r2_txt = str(r2) if r2 is not None else "—"
+            return {
+                "chart_data": rows,
+                "secondary_chart_data": secondary_rows,
+                "chart_meta": {
+                    "mode": "regression_importance",
+                    "primary_chart": "bar",
+                    "secondary_chart": "bar",
+                    "title": f"{target} 표준화 다중회귀 계수(다른 설명변수 통제)",
+                    "secondary_title": "같은 변수의 타깃과 단순 Pearson r (보조)",
+                    "description": (
+                        f"막대 높이는 |표준화 β|×100(부호·정확한 β는 raw_mean). "
+                        f"근사 R²={r2_txt}, n={reg.get('n_samples', '—')}. "
+                        "보조 차트는 변수를 하나씩만 봤을 때의 단순 상관으로, 회귀계수와 다를 수 있습니다."
+                    ),
+                    "value_key": "value",
+                    "secondary_value_key": "value",
+                },
+            }
+
         if target in df.columns and isinstance(features, list) and features:
             rows = []
             for f in features:
@@ -2068,7 +2193,7 @@ def _build_method_visualization(
                     {
                         "category": str(f),
                         "value": round(strength * 100, 2),
-                        "raw_mean": round(strength, 3),
+                        "raw_mean": round(float(r), 4),
                     }
                 )
 
@@ -2076,15 +2201,20 @@ def _build_method_visualization(
                 rows = sorted(rows, key=lambda x: x["value"], reverse=True)
                 return {
                     "chart_data": rows,
-                    "secondary_chart_data": rows,
+                    "secondary_chart_data": [dict(r) for r in rows],
                     "chart_meta": {
                         "mode": "regression_importance",
                         "primary_chart": "bar",
-                        "secondary_chart": "line",
-                        "title": f"{target} 예측 영향도(상관강도 기반)",
-                        "secondary_title": "영향도 추세",
-                        "description": "설명변수별 타깃 연관 강도(절대 상관계수)를 기준으로 정렬했습니다.",
+                        "secondary_chart": "bar",
+                        "title": f"{target}과(와) 설명변수의 단순 상관(|r|)",
+                        "secondary_title": "동일 지표 막대 비교",
+                        "description": (
+                            "다중회귀 표준화계수를 안정적으로 추정하지 못해, "
+                            "각 설명변수와 타깃의 단순 Pearson 상관만 표시했습니다. "
+                            "이는 다른 변수를 통제하지 않은 값이므로 '영향도'로 읽지 마세요."
+                        ),
                         "value_key": "value",
+                        "secondary_value_key": "value",
                     },
                 }
 
@@ -2153,8 +2283,16 @@ def _build_method_options(evidence: dict[str, Any]) -> list[dict[str, str]]:
             "method": "회귀분석 (Regression)",
             "when_to_use": "여러 요인이 목표 변수에 미치는 영향을 보고 예측할 때",
             "current_fit": (
-                f"점수 {scores['회귀분석']['score']}/100: target={reg['target']}, features={', '.join(reg['features'])}"
-                if reg else "적합도 중간: 수치형 변수 3개 이상이면 권장"
+                (
+                    f"점수 {scores['회귀분석']['score']}/100: R²={reg.get('r_squared')}, "
+                    f"target={reg['target']}, β(표준화)={reg.get('standardized_betas')}"
+                )
+                if reg and reg.get("r_squared") is not None
+                else (
+                    f"점수 {scores['회귀분석']['score']}/100: target={reg['target']}, features={', '.join(reg.get('features', []))}"
+                    if reg
+                    else "적합도 중간: 수치형 변수 3개 이상이면 권장"
+                )
             ),
         }
     )
@@ -2335,35 +2473,90 @@ def _build_fallback_response(summary: dict[str, Any], evidence: dict[str, Any], 
 
     if recommended == "상관분석" and c_e:
         explain = (
-            f"핵심 분석으로 상관분석을 권장합니다. {c_e['col_x']}와 {c_e['col_y']}의 상관계수는 "
-            f"r={c_e['r']}, p={c_e['p_value']}로 확인되었습니다. "
-            "변수 간 선형 관계를 빠르게 파악하고 후속 모델링의 방향을 정하는 데 유리합니다."
+            f"핵심 분석으로 상관분석을 권장합니다. {c_e['col_x']}와 {c_e['col_y']}의 Pearson 상관은 "
+            f"r={c_e['r']}, p={c_e['p_value']}입니다. "
+            "이는 두 변수가 함께 움직이는 선형 경향을 나타낼 뿐, 인과나 '영향도'를 의미하지는 않습니다."
         )
     elif recommended == "회귀분석" and r_e:
-        explain = (
-            f"핵심 분석으로 회귀분석을 권장합니다. 목표변수는 {r_e['target']}이며, "
-            f"주요 설명변수는 {', '.join(r_e['features'])}입니다. "
-            "각 변수의 영향력을 동시에 확인하고 예측 모델을 구축할 수 있습니다."
-        )
+        betas = r_e.get("standardized_betas") if isinstance(r_e.get("standardized_betas"), dict) else {}
+        r2 = r_e.get("r_squared")
+        if betas and r2 is not None:
+            top = max(betas.items(), key=lambda x: abs(float(x[1])))
+            explain = (
+                f"핵심 분석으로 다중 선형회귀(설명변수 표준화) 근거를 제시합니다. 종속변수는 {r_e['target']}, "
+                f"설명변수는 {', '.join(r_e.get('features', []))}입니다. "
+                f"근사 R²는 {r2}이며, 절대값이 가장 큰 표준화 계수는 {top[0]}(β≈{top[1]})입니다. "
+                "계수는 다른 설명변수를 맞춰 둔 상태에서의 가중치에 가깝게 해석할 수 있습니다."
+            )
+        else:
+            explain = (
+                f"회귀 관점에서 {r_e.get('target')}과(와) {', '.join(r_e.get('features', []))}의 연관을 보려 합니다. "
+                "현재는 다중회귀 계수 추정이 불안정해 단순 상관 위주의 차트를 쓸 수 있습니다. "
+                "상관은 다른 변수를 통제하지 않은 값입니다."
+            )
     elif recommended == "ANOVA" and a_e:
+        eta = a_e.get("eta_squared")
         explain = (
-            f"핵심 분석으로 ANOVA를 권장합니다. {a_e['group_col']} 집단 간 {a_e['value_col']} 평균 차이를 비교했을 때 "
-            f"p={a_e['p_value']}로 확인되었습니다. 3개 이상 집단 비교에 적합합니다."
+            f"핵심 분석으로 ANOVA를 권장합니다. {a_e['group_col']} 집단 간 {a_e['value_col']} 평균 차이에서 "
+            f"p={a_e['p_value']}, η²≈{eta}입니다. "
+            "η²는 집단 간 분산이 전체 분산에서 차지하는 비율로, 효과 크기를 가늠하는 데 도움이 됩니다."
         )
     elif recommended == "T-검정" and t_e:
         sig = "유의미" if t_e["p_value"] < 0.05 else "유의미하지 않음"
         explain = (
-            f"핵심 분석으로 T-검정을 권장합니다. {t_e['group_col']}에 따른 {t_e['value_col']} 차이의 p값은 "
-            f"{t_e['p_value']}로 {sig}합니다. 2개 집단 비교 상황에서 해석이 명확합니다."
+            f"핵심 분석으로 T-검정을 권장합니다. {t_e['group_col']}에 따른 {t_e['value_col']} 차이에서 "
+            f"p={t_e['p_value']}로 {sig}합니다. "
+            f"Cohen d≈{t_e.get('cohen_d')}, 평균은 {t_e.get('group_a')}={t_e.get('mean_a')}, {t_e.get('group_b')}={t_e.get('mean_b')}입니다."
         )
     else:
         explain = "현재 데이터는 기술통계를 먼저 확인한 뒤 상관/회귀/집단비교 분석으로 확장하는 것이 적절합니다."
 
-    insights = [
-        f"주 분석 추천: {recommended}",
-        "대안 분석 3개를 함께 제시했으니 목적(관계 파악/영향 추정/집단 비교)에 따라 선택할 수 있습니다.",
-        "원하면 지금 바로 대안 분석(상관/회귀/ANOVA/교차분석) 중 하나를 추가 실행할 수 있습니다.",
-    ]
+    if recommended == "상관분석" and c_e:
+        insights = [
+            f"{c_e['col_x']}–{c_e['col_y']} Pearson r={c_e['r']}, 유의확률 p={c_e['p_value']}입니다.",
+            "p<0.05이면 선형 연관이 우연으로 보기 어렵다는 뜻이지, 원인·결과를 단정할 수는 없습니다.",
+            "분위 구간별 평균 차트는 비선형이나 극단값 패턴을 보조적으로 확인하는 용도입니다.",
+        ]
+    elif recommended == "회귀분석" and r_e:
+        betas = r_e.get("standardized_betas") if isinstance(r_e.get("standardized_betas"), dict) else {}
+        if betas:
+            top = max(betas.items(), key=lambda x: abs(float(x[1])))
+            insights = [
+                f"표준화 OLS에서 |β|가 가장 큰 변수는 {top[0]}(β≈{top[1]})입니다.",
+                f"모형 R²≈{r_e.get('r_squared', '—')} (선형·가법 모형 가정, 결측 제거 후 추정).",
+                "보조 차트의 단순 r은 다른 변수를 넣지 않은 상관이므로 회귀계수와 혼동하지 마세요.",
+            ]
+        else:
+            insights = [
+                f"종속 후보 {r_e.get('target')}에 대해 설명변수 {', '.join(r_e.get('features', []))}와의 단순 상관을 우선 확인합니다.",
+                "다중회귀 표준화계수를 안정적으로 구하지 못해, 차트는 |r| 기반입니다.",
+                "인과 해석이나 정책 결론은 추가 설계·잔차 진단이 필요합니다.",
+            ]
+    elif recommended == "ANOVA" and a_e:
+        insights = [
+            f"{a_e['group_col']} 집단에 따라 {a_e['value_col']} 평균이 다른지 검정한 결과 p={a_e['p_value']}입니다.",
+            f"효과 크기 참고: η²≈{a_e.get('eta_squared')} (집단 간 변산 비중).",
+            "사후검정·등분산 가정 점검이 필요하면 알려 주세요.",
+        ]
+    elif recommended == "T-검정" and t_e:
+        insights = [
+            f"{t_e['group_col']} 두 수준({t_e.get('group_a')}, {t_e.get('group_b')})의 {t_e['value_col']} 평균 차이 p={t_e['p_value']}입니다.",
+            f"효과 크기 Cohen d≈{t_e.get('cohen_d')}입니다.",
+            "표본이 치우쳐 있으면 실무적 의미와 함께 해석하는 것이 좋습니다.",
+        ]
+    elif recommended == "교차분석" and evidence.get("chi_square"):
+        chi = evidence.get("chi_square") or {}
+        insights = [
+            f"{chi.get('col1')}×{chi.get('col2')} 교차분석 χ²={chi.get('chi2')}, p={chi.get('p_value')}입니다.",
+            "막대는 행 기준 비율(%)이며, 범주 순서는 데이터 레이블에 따릅니다.",
+            "기대빈도가 낮은 셀이 많으면 Fisher 정확검정 등을 검토할 수 있습니다.",
+        ]
+    else:
+        insights = [
+            f"주 분석 추천: {recommended}",
+            "대안 분석 옵션은 아래 카드에서 점수와 함께 확인할 수 있습니다.",
+            "질문에 분석 기법 이름을 넣으면 추천 기법을 바꿀 수 있습니다.",
+        ]
 
     return {
         "recommended_method": recommended,
