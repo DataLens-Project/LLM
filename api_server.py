@@ -132,16 +132,20 @@ SYSTEM_PROMPT = """
 """.strip()
 
 EDIT_SYSTEM_PROMPT = """
-너는 Pandas 데이터 수정 전문가다.
-반드시 파이썬 코드 한 줄만 반환하라.
+너는 Pandas 데이터 수정 전문가다. 응답에는 실행 가능한 파이썬 코드만 포함하고, 설명·마크다운 제목은 쓰지 마라.
+
+출력 형식:
+- 첫 번째 유효한 코드는 반드시 `df = ...` 형태의 단일 할당문이어야 한다.
+- 한 줄이어도 되고, 괄호/대괄호로 이어지는 여러 줄이어도 되지만, 문장은 반드시 **하나의 df 재할당**으로 끝나야 한다.
+- 코드 블록(```)을 쓸 경우 그 안에 할당문만 넣어라.
 
 규칙:
-1) 반드시 df 변수에 재할당하는 한 줄 코드만 출력 (예: df = df[df['나이'] > 20])
-2) import, 함수 정의, 반복문, 여러 줄 코드 금지
-3) 파일 입출력, 네트워크 호출, 시스템 명령 금지
-4) 컬럼명은 제공된 컬럼 목록만 사용
-5) 사용자가 삭제/제외를 요청하면 해당 조건을 제거하는 필터를 작성
-6) 한국어 설명 문장 없이 코드만 출력
+1) import/함수 정의/class/try/for/while/with/lambda 금지 (pandas 체인과 조건식만)
+2) 파일·네트워크·os/sys/subprocess/eval/exec 금지
+3) 컬럼명은 반드시 요청 JSON의 columns[].name 값만 사용 (임의로 새 이름 만들지 말 것)
+4) "행 제외/삭제"는 `df = df[조건]`으로 남길 행을 필터링하고, "컬럼 삭제"는 `df.drop(columns=[...])` 등으로 처리
+5) 문자열 비교는 `.astype("string").str.strip()`을 적절히 사용
+6) 한국어 문장 출력 금지 — 코드만
 """.strip()
 
 
@@ -174,7 +178,26 @@ _BANNED_CODE_PATTERNS = [
     r"\bto_(csv|excel|sql)\b",
 ]
 
-_ALLOWED_NAME_IDS = {"df", "pd", "np", "True", "False", "None"}
+_ALLOWED_NAME_IDS = {
+    "df",
+    "pd",
+    "np",
+    "True",
+    "False",
+    "None",
+    "round",
+    "int",
+    "float",
+    "str",
+    "bool",
+    "abs",
+    "min",
+    "max",
+    "len",
+    "sorted",
+    "enumerate",
+    "sum",
+}
 
 
 MASK_KEYWORDS = [
@@ -1146,6 +1169,68 @@ def _extract_python_line(text: str) -> str:
     return code.strip()
 
 
+def _extract_df_edit_code_from_llm(text: str) -> str:
+    """LLM 응답에서 `df = ...` 단일 할당 블록을 추출한다 (여러 줄 허용)."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("모델 응답이 비어 있습니다.")
+
+    cleaned = re.sub(r"```(?:python)?", "", text, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+
+    idx = cleaned.find("df =")
+    if idx < 0:
+        raise ValueError("모델 응답에서 df = 할당문을 찾을 수 없습니다.")
+
+    candidate = cleaned[idx:].strip()
+    lines = candidate.splitlines()
+
+    for end in range(len(lines), 0, -1):
+        block = "\n".join(lines[:end]).strip()
+        if not block:
+            continue
+        try:
+            tree = ast.parse(block, mode="exec")
+        except SyntaxError:
+            continue
+        if len(tree.body) == 1 and isinstance(tree.body[0], ast.Assign):
+            targets = tree.body[0].targets
+            if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == "df":
+                return block
+
+    raise ValueError("유효한 df 재할당 코드를 파싱하지 못했습니다.")
+
+
+def _llm_edit_code(command: str, df: pd.DataFrame) -> str:
+    schema = [
+        {
+            "name": str(col),
+            "dtype": str(df[col].dtype),
+            "samples": [_to_jsonable_value(v) for v in df[col].dropna().head(5).tolist()],
+        }
+        for col in df.columns
+    ]
+    model = os.environ.get("DATALENS_EDIT_OLLAMA_MODEL", "llama3.2")
+    llm_response = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": EDIT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "user_command": command,
+                        "columns": schema,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    )
+    raw = llm_response.get("message", {}).get("content", "")
+    extracted = _extract_df_edit_code_from_llm(raw)
+    return _validate_edit_code(extracted)
+
+
 def _validate_edit_code(code: str) -> str:
     if not isinstance(code, str):
         raise ValueError("수정 코드는 문자열이어야 합니다.")
@@ -1153,8 +1238,6 @@ def _validate_edit_code(code: str) -> str:
     cleaned = code.strip()
     if not cleaned:
         raise ValueError("빈 수정 코드는 허용되지 않습니다.")
-    if "\n" in cleaned or ";" in cleaned:
-        raise ValueError("수정 코드는 반드시 한 줄이어야 합니다.")
     if not cleaned.startswith("df ="):
         raise ValueError("수정 코드는 반드시 df에 재할당해야 합니다.")
 
@@ -1169,7 +1252,7 @@ def _validate_edit_code(code: str) -> str:
         raise ValueError(f"코드 구문 오류: {exc}") from exc
 
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
-        raise ValueError("단일 할당문만 허용됩니다.")
+        raise ValueError("단일 df 재할당문만 허용됩니다. 세미콜론으로 문장을 이어 여러 문장을 넣지 마라.")
 
     assign_stmt = tree.body[0]
     if len(assign_stmt.targets) != 1 or not isinstance(assign_stmt.targets[0], ast.Name):
@@ -1249,6 +1332,27 @@ def _fallback_edit_code(command: str, df: pd.DataFrame) -> str:
     if direct_put:
         return direct_put
 
+    drop_m = re.search(
+        r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?:컬럼|열)\s*(?:을|를)?\s*(?:삭제|제거|지워|없애)",
+        q,
+    )
+    if drop_m:
+        col_hint = _strip_particle(_cleanup_column_hint(drop_m.group("col")))
+        resolved_col = _resolve_column_name(col_hint, list(df.columns))
+        if resolved_col:
+            return f"df = df.drop(columns=[{repr(resolved_col)}])"
+
+    ren_m = re.search(
+        r"(?P<old>[가-힣A-Za-z0-9_\s]+?)\s*(?:컬럼|열)?\s*(?:을|를)\s*(?P<new>[가-힣A-Za-z0-9_\s]+?)\s*(?:으로|로)\s*(?:변경|바꿔|수정|이름)",
+        q,
+    )
+    if ren_m:
+        old_hint = _strip_particle(_cleanup_column_hint(ren_m.group("old")))
+        new_name = ren_m.group("new").strip()
+        old_resolved = _resolve_column_name(old_hint, list(df.columns))
+        if old_resolved and new_name:
+            return f"df = df.rename(columns={{{repr(old_resolved)}: {repr(new_name)}}})"
+
     numeric_filter = re.search(
         r"(?P<col>[가-힣A-Za-z0-9_\s]+?)\s*(?P<op>이하|미만|이상|초과|<=|>=|<|>)\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?:인)?\s*(?:행|데이터|사람)?\s*(?P<action>제외|삭제|빼고|빼줘|제거|남겨|필터|유지)",
         q,
@@ -1306,41 +1410,21 @@ def _fallback_edit_code(command: str, df: pd.DataFrame) -> str:
 
 def _generate_edit_code(command: str, df: pd.DataFrame) -> str:
     use_llm = os.environ.get("DATALENS_USE_LLM_EDIT", os.environ.get("DATALENS_USE_LLM", "0")) == "1"
+    rule_first = os.environ.get("DATALENS_EDIT_RULE_FIRST", "0") == "1"
 
-    # 규칙 기반 해석을 우선 적용해 사용자 명령 반영 정확도를 높인다.
-    try:
-        return _fallback_edit_code(command, df)
-    except Exception:
-        pass
+    if use_llm and rule_first:
+        try:
+            return _fallback_edit_code(command, df)
+        except ValueError:
+            try:
+                return _llm_edit_code(command, df)
+            except Exception:
+                pass
+            return _fallback_edit_code(command, df)
 
     if use_llm:
         try:
-            schema = [
-                {
-                    "name": str(col),
-                    "dtype": str(df[col].dtype),
-                    "samples": [_to_jsonable_value(v) for v in df[col].dropna().head(3).tolist()],
-                }
-                for col in df.columns
-            ]
-            llm_response = ollama.chat(
-                model="llama3.2",
-                messages=[
-                    {"role": "system", "content": EDIT_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "user_command": command,
-                                "columns": schema,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    },
-                ],
-            )
-            candidate = _extract_python_line(llm_response["message"]["content"])
-            return _validate_edit_code(candidate)
+            return _llm_edit_code(command, df)
         except Exception:
             pass
 
@@ -1411,16 +1495,21 @@ def _build_numeric_profile_chart_data(df: pd.DataFrame) -> list[dict[str, Any]]:
     if chart_data_raw:
         means = [item["raw_mean"] for item in chart_data_raw]
         mn, mx = min(means), max(means)
+        single_series = len(chart_data_raw) == 1
         for item in chart_data_raw:
-            if mx > mn:
-                scaled = (item["raw_mean"] - mn) / (mx - mn) * 100
+            raw_mean = float(item["raw_mean"])
+            if single_series:
+                # 단일 변수일 때 0~100 스케일은 의미 없으므로 실제 평균을 value로 사용
+                scaled = raw_mean
+            elif mx > mn:
+                scaled = (raw_mean - mn) / (mx - mn) * 100
             else:
-                scaled = 50.0
+                scaled = raw_mean
             chart_data.append(
                 {
                     "category": item["category"],
-                    "value": round(float(scaled), 2),
-                    "raw_mean": round(float(item["raw_mean"]), 3),
+                    "value": round(float(scaled), 4),
+                    "raw_mean": round(raw_mean, 3),
                 }
             )
     return chart_data
@@ -1878,23 +1967,49 @@ def _build_method_visualization(
 
     if method_norm in ["ANOVA", "T-검정"] and isinstance(evidence.get("group_metric"), dict):
         gm = evidence.get("group_metric")
+        gcol, vcol = gm.get("group_col"), gm.get("value_col")
+        secondary_rows: list[dict[str, Any]] = []
+        if isinstance(gcol, str) and isinstance(vcol, str) and gcol in df.columns and vcol in df.columns:
+            try:
+                sub = df[[gcol, vcol]].copy()
+                sub[gcol] = sub[gcol].astype("string").str.strip()
+                sub[gcol] = sub[gcol].replace({"": np.nan, "nan": np.nan, "None": np.nan, "<NA>": np.nan})
+                sub = sub.dropna(subset=[gcol, vcol])
+                if len(sub) > 0:
+                    cnt = sub.groupby(gcol, observed=True).size().reset_index(name="n")
+                    order = [str(r.get("category")) for r in default_chart_data]
+                    cmap = {str(r[gcol]): int(r["n"]) for _, r in cnt.iterrows()}
+                    if order:
+                        secondary_rows = [
+                            {"category": cat, "value": float(cmap.get(cat, 0)), "raw_mean": float(cmap.get(cat, 0))}
+                            for cat in order
+                        ]
+                    else:
+                        secondary_rows = [
+                            {"category": str(r[gcol]), "value": float(r["n"]), "raw_mean": float(r["n"])}
+                            for _, r in cnt.iterrows()
+                        ]
+            except Exception:
+                secondary_rows = []
+
+        if not secondary_rows:
+            secondary_rows = [
+                {"category": str(r.get("category")), "value": float(r.get("raw_mean", r.get("value", 0))), "raw_mean": float(r.get("raw_mean", r.get("value", 0)))}
+                for r in default_chart_data
+            ]
+
         return {
             "chart_data": default_chart_data,
-            "secondary_chart_data": [
-                {
-                    "category": str(r.get("category")),
-                    "value": float(r.get("raw_mean", r.get("value", 0))),
-                }
-                for r in default_chart_data
-            ],
+            "secondary_chart_data": secondary_rows,
             "chart_meta": {
                 "mode": "group_compare",
                 "primary_chart": "bar",
-                "secondary_chart": "line",
+                "secondary_chart": "bar",
                 "title": f"{gm.get('group_col')}별 {gm.get('value_col')} 평균 비교",
-                "secondary_title": "그룹 평균 추세",
-                "description": f"{gm.get('group_col')} 집단별 {gm.get('value_col')} 평균을 비교합니다.",
+                "secondary_title": "집단별 표본 수",
+                "description": f"{gm.get('group_col')} 집단별 {gm.get('value_col')} 평균과 각 집단 행 수를 함께 확인합니다.",
                 "value_key": "raw_mean",
+                "secondary_value_key": "value",
             },
         }
 
@@ -1912,20 +2027,24 @@ def _build_method_visualization(
                     grouped = sub.groupby("_bin", observed=True)[y_col].mean().reset_index()
                     grouped = grouped.rename(columns={y_col: "raw_mean"})
                     rows = []
-                    for i, row in grouped.iterrows():
+                    for _, row in grouped.iterrows():
                         raw = float(row["raw_mean"])
-                        rows.append({"category": f"Q{i+1}", "value": round(raw, 3), "raw_mean": round(raw, 3)})
+                        cat = str(row["_bin"])
+                        if len(cat) > 48:
+                            cat = cat[:45] + "…"
+                        rows.append({"category": cat, "value": round(raw, 4), "raw_mean": round(raw, 4)})
                     return {
                         "chart_data": rows,
-                        "secondary_chart_data": rows,
+                        "secondary_chart_data": [dict(r) for r in rows],
                         "chart_meta": {
                             "mode": "correlation_curve",
                             "primary_chart": "line",
                             "secondary_chart": "bar",
                             "title": f"{x_col} 구간별 {y_col} 평균 추세",
-                            "secondary_title": "구간 평균 비교",
-                            "description": f"상관 강도(r={corr.get('r')})가 큰 변수쌍의 구간별 평균 패턴입니다.",
+                            "secondary_title": "구간별 평균 막대",
+                            "description": f"상관 강도(r={corr.get('r')})가 큰 변수쌍에 대해 {x_col} 분위 구간별 {y_col} 평균을 보여 줍니다.",
                             "value_key": "raw_mean",
+                            "secondary_value_key": "raw_mean",
                         },
                     }
                 except Exception:
@@ -1986,12 +2105,10 @@ def _build_method_visualization(
                         }
                         for idx in tbl.index
                     ]
+                    m2 = sub[c2].astype("string").str.strip().value_counts(normalize=True) * 100
                     secondary = [
-                        {
-                            "category": str(col),
-                            "value": round(float(tbl[col].mean()), 2),
-                        }
-                        for col in tbl.columns
+                        {"category": str(k), "value": round(float(v), 2), "raw_mean": round(float(v), 2)}
+                        for k, v in m2.items()
                     ]
                     return {
                         "chart_data": rows,
@@ -2000,10 +2117,11 @@ def _build_method_visualization(
                             "mode": "categorical_association",
                             "primary_chart": "bar",
                             "secondary_chart": "bar",
-                            "title": f"{c1}별 {c2} 비율 비교",
-                            "secondary_title": f"{c2} 평균 비율",
-                            "description": f"교차분석의 기준 변수는 {c1}, 비교 변수는 {c2}입니다.",
+                            "title": f"{c1} 범주별 '{main_col}' 비중(행 정규화 %)",
+                            "secondary_title": f"{c2} 전체 범주 비율(%)",
+                            "description": f"막대: {c1} 각 수준에서 {c2}='{main_col}' 비율. 오른쪽 차트: {c2} 변수의 전체 분포입니다.",
                             "value_key": "value",
+                            "secondary_value_key": "value",
                         },
                     }
 
